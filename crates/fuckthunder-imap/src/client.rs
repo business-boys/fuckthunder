@@ -546,6 +546,66 @@ impl ImapClient {
         Ok(events)
     }
 
+    /// Idles until `predicate` matches a server event or `max_wait` elapses.
+    ///
+    /// Events are fed to `predicate` as they arrive; the first `Some` it
+    /// returns becomes the result and the IDLE window is closed immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when nothing matches before `max_wait`, or
+    /// propagates transport/protocol errors.
+    pub async fn idle_until<T>(
+        &mut self,
+        max_wait: Duration,
+        mut predicate: impl FnMut(&Response) -> Option<T>,
+    ) -> Result<T> {
+        self.require("IDLE")?;
+        let tag = self.connection.next_tag();
+        self.connection
+            .write_all(format!("{tag} IDLE\r\n").as_bytes())
+            .await?;
+        let mut result = None;
+        let deadline = Instant::now() + max_wait;
+        // Wait for the continuation that starts the idle window.
+        loop {
+            match self.connection.read_untagged().await? {
+                Response::Continuation { .. } => break,
+                Response::Untagged(untagged) => {
+                    if let Some(value) = predicate(&Response::Untagged(untagged.clone())) {
+                        result = Some(value);
+                    }
+                }
+                Response::Tagged {
+                    status, code, text, ..
+                } => return Err(Error::Server { status, code, text }),
+            }
+        }
+        while result.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, self.connection.read_untagged()).await {
+                Ok(Ok(Response::Untagged(untagged))) => {
+                    if let Some(value) = predicate(&Response::Untagged(untagged)) {
+                        result = Some(value);
+                    }
+                }
+                Ok(Ok(Response::Continuation { .. })) => {}
+                Ok(Ok(Response::Tagged { .. })) => break,
+                Ok(Err(error)) => {
+                    let _ = self.connection.write_all(b"DONE\r\n").await;
+                    return Err(error);
+                }
+                Err(_) => break,
+            }
+        }
+        self.connection.write_all(b"DONE\r\n").await?;
+        self.connection.send_tagged(&tag).await?;
+        result.ok_or(Error::Timeout)
+    }
+
     fn require(&self, capability: &str) -> Result<()> {
         if self.capabilities().has(capability) {
             Ok(())

@@ -502,3 +502,71 @@ async fn connects_through_socks5_proxy() {
     client.logout().await.unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn idle_until_matches_event() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(socket);
+        io.write_all(format!("* OK [CAPABILITY {CAPS}] mock ready\r\n").as_bytes())
+            .await
+            .unwrap();
+        let (tag, _t) = read_command(&mut io).await; // CAPABILITY
+        reply(&mut io, &tag, &[&format!("* CAPABILITY {CAPS}\r\n")], "OK").await;
+        let (tag, _t) = read_command(&mut io).await; // LOGIN
+        reply(&mut io, &tag, &[], "OK login").await;
+        let (tag, text) = read_command(&mut io).await; // ID
+        assert!(text.to_ascii_uppercase().contains(" ID "));
+        reply(&mut io, &tag, &["* ID NIL\r\n"], "OK").await;
+        let (tag, _t) = read_command(&mut io).await; // SELECT
+        reply(
+            &mut io,
+            &tag,
+            &["* 1 EXISTS\r\n"],
+            "OK [READ-WRITE] selected",
+        )
+        .await;
+        loop {
+            let (tag, text) = read_command(&mut io).await;
+            let upper = text.to_ascii_uppercase();
+            if upper.contains("IDLE") {
+                io.write_all(b"+ idling\r\n").await.unwrap();
+                io.write_all(b"* 2 EXISTS\r\n").await.unwrap();
+                let mut done = Vec::new();
+                io.read_until(b'\n', &mut done).await.unwrap();
+                reply(&mut io, &tag, &[], "OK idle done").await;
+            } else {
+                assert!(upper.contains("LOGOUT"));
+                reply(&mut io, &tag, &["* BYE bye\r\n"], "OK").await;
+                break;
+            }
+        }
+    });
+
+    let config = ClientConfig::plaintext("127.0.0.1", port).with_timeout(Duration::from_secs(5));
+    let mut client = ImapClient::connect(config).await.unwrap();
+    client.login("a", "b").await.unwrap();
+    let inbox = MailboxName::from_utf8("INBOX").unwrap();
+    client.select(&inbox, false).await.unwrap();
+
+    let count = client
+        .idle_until(Duration::from_secs(5), |event| match event {
+            fuckthunder_imap_proto::Response::Untagged(
+                fuckthunder_imap_proto::Untagged::Exists(n),
+            ) if *n >= 2 => Some(*n),
+            _ => None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // Timeout path: predicate that never matches.
+    let result: Result<u32, _> = client
+        .idle_until(Duration::from_millis(300), |_| None)
+        .await;
+    assert!(matches!(result, Err(fuckthunder_core::Error::Timeout)));
+    client.logout().await.unwrap();
+    server.await.unwrap();
+}
