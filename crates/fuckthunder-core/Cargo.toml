@@ -1,0 +1,16 @@
+[package]
+name = "fuckthunder-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Domain types shared by the fuckthunder IMAP/OAuth stack"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fuckthunder-core",
+    "crates/fuckthunder-imap-proto",
+    "crates/fuckthunder-sasl",
+    "crates/fuckthunder-oauth",
+    "crates/fuckthunder-imap",
+    "crates/fuckthunder-cli",
+    "crates/fuckthunder-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MPL-2.0"
+repository = "https://example.invalid/fuckthunder"
+
+[workspace.dependencies]
+fuckthunder-core = { path = "crates/fuckthunder-core" }
+fuckthunder-imap-proto = { path = "crates/fuckthunder-imap-proto" }
+fuckthunder-sasl = { path = "crates/fuckthunder-sasl" }
+fuckthunder-oauth = { path = "crates/fuckthunder-oauth" }
+fuckthunder-imap = { path = "crates/fuckthunder-imap" }
+
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+flate2 = "1"
+hmac = "0.12"
+md-5 = "0.10"
+memchr = "2"
+proptest = "1"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

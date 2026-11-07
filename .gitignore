@@ -1,0 +1,6 @@
+/target
+/legacy
+/fixtures/parity
+/tmp
+*.profraw
+*.profdata

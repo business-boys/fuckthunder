@@ -1,0 +1,22 @@
+[package]
+name = "fuckthunder-oauth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OAuth 2.0 authorization-code + PKCE and device flows for IMAP providers"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+fuckthunder-core.workspace = true
+rand.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "fuckthunder-sasl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SASL mechanisms used by the IMAP client (PLAIN, LOGIN, CRAM-MD5, XOAUTH2, OAUTHBEARER)"
+
+[dependencies]
+base64.workspace = true
+fuckthunder-core.workspace = true
+hmac.workspace = true
+md-5.workspace = true
+
+[dev-dependencies]

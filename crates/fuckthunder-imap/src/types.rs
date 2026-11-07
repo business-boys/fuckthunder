@@ -1,0 +1,209 @@
+//! Connection configuration and session state.
+
+use std::time::Duration;
+
+use fuckthunder_core::{FlagSet, MailboxName};
+
+use crate::transport::TlsMode;
+
+/// Connection state of an IMAP session (RFC 3501 §3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    /// Before authentication.
+    NotAuthenticated,
+    /// Authenticated but no mailbox selected.
+    Authenticated,
+    /// A mailbox is selected.
+    Selected(MailboxName),
+    /// `LOGOUT` has completed.
+    Logout,
+}
+
+impl State {
+    /// Human-readable state name used in error messages.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NotAuthenticated => "not-authenticated",
+            Self::Authenticated => "authenticated",
+            Self::Selected(_) => "selected",
+            Self::Logout => "logout",
+        }
+    }
+}
+
+/// SOCKS5 proxy settings (RFC 1928).
+#[derive(Clone, Debug)]
+pub struct ProxyConfig {
+    /// Proxy host name or address.
+    pub host: String,
+    /// Proxy port.
+    pub port: u16,
+    /// Optional username/password authentication (RFC 1929).
+    pub auth: Option<(String, String)>,
+}
+
+/// Configuration for opening an IMAP connection.
+#[derive(Clone, Debug)]
+pub struct ClientConfig {
+    /// Server host name (also used for certificate validation).
+    pub host: String,
+    /// Server port.
+    pub port: u16,
+    /// Transport security mode.
+    pub tls: TlsMode,
+    /// Per-operation timeout.
+    pub timeout: Duration,
+    /// Largest literal the client will accept, in bytes.
+    pub max_literal: usize,
+    /// Optional SOCKS5 proxy the connection is tunnelled through.
+    pub proxy: Option<ProxyConfig>,
+}
+
+impl ClientConfig {
+    /// Implicit TLS on port 993.
+    #[must_use]
+    pub fn tls(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: 993,
+            tls: TlsMode::Implicit,
+            timeout: Duration::from_secs(30),
+            max_literal: 64 * 1024 * 1024,
+            proxy: None,
+        }
+    }
+
+    /// `STARTTLS` on port 143.
+    #[must_use]
+    pub fn starttls(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: 143,
+            tls: TlsMode::StartTls,
+            timeout: Duration::from_secs(30),
+            max_literal: 64 * 1024 * 1024,
+            proxy: None,
+        }
+    }
+
+    /// Plain TCP (tests and loopback servers only).
+    #[must_use]
+    pub fn plaintext(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            tls: TlsMode::Plain,
+            timeout: Duration::from_secs(10),
+            max_literal: 16 * 1024 * 1024,
+            proxy: None,
+        }
+    }
+
+    /// Overrides the timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Overrides the literal limit.
+    #[must_use]
+    pub fn with_max_literal(mut self, bytes: usize) -> Self {
+        self.max_literal = bytes;
+        self
+    }
+
+    /// Tunnels the connection through a SOCKS5 proxy without authentication.
+    #[must_use]
+    pub fn with_socks5(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.proxy = Some(ProxyConfig {
+            host: host.into(),
+            port,
+            auth: None,
+        });
+        self
+    }
+
+    /// Tunnels the connection through a SOCKS5 proxy with username/password
+    /// authentication (RFC 1929).
+    #[must_use]
+    pub fn with_socks5_auth(
+        mut self,
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.proxy = Some(ProxyConfig {
+            host: host.into(),
+            port,
+            auth: Some((user.into(), password.into())),
+        });
+        self
+    }
+}
+
+/// State captured by `SELECT`/`EXAMINE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectInfo {
+    /// `EXISTS` count.
+    pub exists: u32,
+    /// `RECENT` count.
+    pub recent: u32,
+    /// First unseen message sequence number.
+    pub unseen: Option<u32>,
+    /// Mailbox UID validity.
+    pub uid_validity: Option<u32>,
+    /// Predicted next UID.
+    pub uid_next: Option<u32>,
+    /// Flags currently in use.
+    pub flags: FlagSet,
+    /// Flags the client may store.
+    pub permanent_flags: Option<FlagSet>,
+    /// `true` for `EXAMINE` or `[READ-ONLY]`.
+    pub read_only: bool,
+    /// Highest modification sequence (RFC 7162).
+    pub highest_mod_seq: Option<u64>,
+}
+
+impl SelectInfo {
+    /// Returns the mailbox name that was selected.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "{} messages, {} recent, unseen={:?}, uidvalidity={:?}",
+            self.exists, self.recent, self.unseen, self.uid_validity
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults() {
+        let tls = ClientConfig::tls("imap.example.org");
+        assert_eq!(tls.port, 993);
+        assert_eq!(tls.tls, TlsMode::Implicit);
+        let starttls = ClientConfig::starttls("imap.example.org");
+        assert_eq!(starttls.port, 143);
+        assert_eq!(starttls.tls, TlsMode::StartTls);
+        let plain = ClientConfig::plaintext("127.0.0.1", 1430)
+            .with_timeout(Duration::from_secs(1))
+            .with_max_literal(1024);
+        assert_eq!(plain.max_literal, 1024);
+    }
+
+    #[test]
+    fn state_names() {
+        assert_eq!(State::NotAuthenticated.name(), "not-authenticated");
+        assert_eq!(State::Authenticated.name(), "authenticated");
+        assert_eq!(
+            State::Selected(MailboxName::from_utf8("INBOX").unwrap()).name(),
+            "selected"
+        );
+        assert_eq!(State::Logout.name(), "logout");
+    }
+}

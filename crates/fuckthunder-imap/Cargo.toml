@@ -1,0 +1,21 @@
+[package]
+name = "fuckthunder-imap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Async safe-Rust IMAP client with TLS, STARTTLS, compression, IDLE and OAuth"
+
+[dependencies]
+async-compression = { version = "0.4", features = ["tokio", "zlib"] }
+fuckthunder-core.workspace = true
+fuckthunder-imap-proto.workspace = true
+fuckthunder-sasl.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+tokio.workspace = true
+tokio-rustls = "0.26"
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio.workspace = true

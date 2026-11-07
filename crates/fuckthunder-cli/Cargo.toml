@@ -1,0 +1,21 @@
+[package]
+name = "fuckthunder-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line IMAP/OAuth client for the fuckthunder stack"
+
+[[bin]]
+name = "fuckthunder"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+fuckthunder-core.workspace = true
+fuckthunder-imap.workspace = true
+fuckthunder-imap-proto.workspace = true
+fuckthunder-oauth.workspace = true
+tokio.workspace = true
+url.workspace = true
