@@ -177,6 +177,8 @@ async fn imap_command(cli: &Cli, command: Commands) -> Result<()> {
             }
         }
         Commands::Fetch { set, uid } => {
+            let inbox = MailboxName::from_utf8("INBOX")?;
+            client.select(&inbox, false).await?;
             let set: SequenceSet = set.parse()?;
             let items = FetchItems::summary();
             let messages = if uid {
@@ -197,13 +199,15 @@ async fn imap_command(cli: &Cli, command: Commands) -> Result<()> {
             }
         }
         Commands::Search { criteria } => {
-            let ids = client.uid_search(&SearchQuery::new()).await;
-            let _ = ids;
+            let inbox = MailboxName::from_utf8("INBOX")?;
+            client.select(&inbox, false).await?;
             // The raw criteria string is validated by the protocol layer.
             let query: SearchQuery = criteria.parse().unwrap_or_else(|_| SearchQuery::all());
             println!("{:?}", client.uid_search(&query).await?);
         }
         Commands::Idle { seconds } => {
+            let inbox = MailboxName::from_utf8("INBOX")?;
+            client.select(&inbox, false).await?;
             for event in client.idle_for(Duration::from_secs(seconds)).await? {
                 println!("{event:?}");
             }
