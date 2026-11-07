@@ -33,6 +33,7 @@ use crate::types::{ClientConfig, SelectInfo, State};
 /// ```
 pub struct ImapClient {
     connection: Connection,
+    identity: Option<Vec<(String, String)>>,
 }
 
 impl ImapClient {
@@ -48,7 +49,10 @@ impl ImapClient {
             connection.start_tls().await?;
         }
         connection.capability().await?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            identity: config.identity.clone(),
+        })
     }
 
     /// Returns the negotiated capabilities.
@@ -95,7 +99,8 @@ impl ImapClient {
     ///
     /// Fails when the server rejects the credentials.
     pub async fn login(&mut self, user: &str, password: &str) -> Result<()> {
-        self.connection.login(user, password).await
+        self.connection.login(user, password).await?;
+        self.maybe_id().await
     }
 
     /// Authenticates with an explicit SASL mechanism.
@@ -104,7 +109,8 @@ impl ImapClient {
     ///
     /// Fails when the exchange is rejected.
     pub async fn authenticate(&mut self, mechanism: &mut dyn Mechanism) -> Result<()> {
-        self.connection.authenticate(mechanism).await
+        self.connection.authenticate(mechanism).await?;
+        self.maybe_id().await
     }
 
     /// Authenticates with an OAuth bearer token, preferring `OAUTHBEARER` and
@@ -131,6 +137,38 @@ impl ImapClient {
         let credentials = Credentials::bearer(user, token);
         let mut mechanism = fuckthunder_sasl::mechanism(name, &credentials)?;
         self.authenticate(mechanism.as_mut()).await
+    }
+
+    /// Sends `ID` (RFC 2971) and returns the server's own `ID` reply, if any.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server refuses the command.
+    pub async fn id(&mut self, fields: &[(&str, &str)]) -> Result<Vec<(String, Option<String>)>> {
+        let outcome = self.connection.execute(Command::id(fields)).await?;
+        for response in &outcome.untagged {
+            if let Response::Untagged(Untagged::Id(fields)) = response {
+                return Ok(fields.clone());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Sends the configured `ID` after authentication when the server
+    /// advertises the extension (mirrors Thunderbird's behaviour).
+    async fn maybe_id(&mut self) -> Result<()> {
+        let Some(fields) = self.identity.clone() else {
+            return Ok(());
+        };
+        if !self.capabilities().has("ID") {
+            return Ok(());
+        }
+        let refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        self.id(&refs).await?;
+        Ok(())
     }
 
     /// `SELECT` or `EXAMINE`.

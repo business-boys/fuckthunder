@@ -383,7 +383,7 @@ impl Connection {
     #[must_use]
     pub fn next_tag(&mut self) -> String {
         self.tag_counter += 1;
-        format!("a{}", self.tag_counter)
+        self.tag_counter.to_string()
     }
 
     fn check_tag(&self, expected: &str, actual: &str) -> Result<()> {

@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 const CAPS: &str =
-    "IMAP4rev1 UIDPLUS MOVE IDLE ENABLE CONDSTORE AUTH=PLAIN AUTH=CRAM-MD5 AUTH=XOAUTH2";
+    "IMAP4rev1 UIDPLUS MOVE IDLE ENABLE CONDSTORE ID AUTH=PLAIN AUTH=CRAM-MD5 AUTH=XOAUTH2";
 
 /// Reads one complete command line, handling literals with continuations.
 async fn read_command(io: &mut BufReader<TcpStream>) -> (String, String) {
@@ -403,9 +403,16 @@ async fn sasl_cram_md5_over_mock_server() {
         io.read_until(b'\n', &mut response).await.unwrap();
         assert!(!response.starts_with(b"*")); // base64 response, not a command
         reply(&mut io, &tag, &[], "OK authenticated").await;
-        let (tag, text) = read_command(&mut io).await; // LOGOUT
-        assert!(text.contains("LOGOUT"));
-        reply(&mut io, &tag, &["* BYE bye\r\n"], "OK logout completed").await;
+        loop {
+            let (tag, text) = read_command(&mut io).await;
+            if text.contains("ID") {
+                reply(&mut io, &tag, &["* ID NIL\r\n"], "OK").await;
+                continue;
+            }
+            assert!(text.contains("LOGOUT"));
+            reply(&mut io, &tag, &["* BYE bye\r\n"], "OK logout completed").await;
+            break;
+        }
     });
 
     let config = ClientConfig::plaintext("127.0.0.1", port).with_timeout(Duration::from_secs(5));

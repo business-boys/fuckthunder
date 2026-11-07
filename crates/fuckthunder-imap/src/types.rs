@@ -43,6 +43,17 @@ pub struct ProxyConfig {
     pub auth: Option<(String, String)>,
 }
 
+/// Identity presented by default in the post-login `ID` command.
+///
+/// Mirrors what Thunderbird 128 sends.
+#[must_use]
+pub fn default_identity() -> Vec<(String, String)> {
+    vec![
+        ("name".to_string(), "Thunderbird".to_string()),
+        ("version".to_string(), "128.5.0esr".to_string()),
+    ]
+}
+
 /// Configuration for opening an IMAP connection.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -58,6 +69,8 @@ pub struct ClientConfig {
     pub max_literal: usize,
     /// Optional SOCKS5 proxy the connection is tunnelled through.
     pub proxy: Option<ProxyConfig>,
+    /// `ID` fields sent after login (RFC 2971). `None` disables it.
+    pub identity: Option<Vec<(String, String)>>,
 }
 
 impl ClientConfig {
@@ -71,6 +84,7 @@ impl ClientConfig {
             timeout: Duration::from_secs(30),
             max_literal: 64 * 1024 * 1024,
             proxy: None,
+            identity: Some(default_identity()),
         }
     }
 
@@ -84,6 +98,7 @@ impl ClientConfig {
             timeout: Duration::from_secs(30),
             max_literal: 64 * 1024 * 1024,
             proxy: None,
+            identity: Some(default_identity()),
         }
     }
 
@@ -97,6 +112,7 @@ impl ClientConfig {
             timeout: Duration::from_secs(10),
             max_literal: 16 * 1024 * 1024,
             proxy: None,
+            identity: Some(default_identity()),
         }
     }
 
@@ -111,6 +127,30 @@ impl ClientConfig {
     #[must_use]
     pub fn with_max_literal(mut self, bytes: usize) -> Self {
         self.max_literal = bytes;
+        self
+    }
+
+    /// Overrides the `ID` fields sent after login (RFC 2971).
+    #[must_use]
+    pub fn with_identity<I, K, V>(mut self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.identity = Some(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        );
+        self
+    }
+
+    /// Disables the post-login `ID` command entirely.
+    #[must_use]
+    pub fn without_identity(mut self) -> Self {
+        self.identity = None;
         self
     }
 
