@@ -167,9 +167,11 @@ Env vars: `FUCKTHUNDER_HOST`, `FUCKTHUNDER_PORT`, `FUCKTHUNDER_USER`,
 ## GPUI checker and mail viewer
 
 ```bash
-cargo run -p fuckthunder-gui -- accounts.txt --concurrency 8
+cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt --concurrency 8
 # Optional per-process SOCKS5H or HTTP CONNECT proxy:
-cargo run -p fuckthunder-gui -- accounts.txt --proxy socks5://user:pass@proxy:1080
+cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt --proxy socks5://user:pass@proxy:1080
+# Headless batch-only driver:
+cargo run -p fuckthunder-gui --bin fuckthunder-check -- accounts.txt --concurrency 10
 ```
 
 The input is UTF-8 `email:password` text (CRLF accepted, passwords may contain
