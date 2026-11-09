@@ -32,15 +32,38 @@ impl State {
     }
 }
 
-/// SOCKS5 proxy settings (RFC 1928).
-#[derive(Clone, Debug)]
+/// Protocol used to establish a proxy tunnel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyProtocol {
+    /// SOCKS5 with remote DNS resolution (RFC 1928).
+    Socks5,
+    /// HTTP CONNECT (RFC 9110).
+    HttpConnect,
+}
+
+/// Proxy tunnel settings.
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Proxy host name or address.
     pub host: String,
     /// Proxy port.
     pub port: u16,
-    /// Optional username/password authentication (RFC 1929).
+    /// Optional username/password authentication.
     pub auth: Option<(String, String)>,
+    /// Protocol used to establish the tunnel.
+    pub protocol: ProxyProtocol,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .field("protocol", &self.protocol)
+            .finish()
+    }
 }
 
 /// Identity presented by default in the post-login `ID` command.
@@ -67,10 +90,13 @@ pub struct ClientConfig {
     pub timeout: Duration,
     /// Largest literal the client will accept, in bytes.
     pub max_literal: usize,
-    /// Optional SOCKS5 proxy the connection is tunnelled through.
+    /// Optional proxy the connection is tunnelled through.
     pub proxy: Option<ProxyConfig>,
     /// `ID` fields sent after login (RFC 2971). `None` disables it.
     pub identity: Option<Vec<(String, String)>>,
+    /// Reproduce Thunderbird's exact post-login command rhythm
+    /// (`ID` -> `NAMESPACE` -> `ENABLE` -> `SELECT INBOX`).
+    pub thunderbird_rhythm: bool,
 }
 
 impl ClientConfig {
@@ -85,6 +111,7 @@ impl ClientConfig {
             max_literal: 64 * 1024 * 1024,
             proxy: None,
             identity: Some(default_identity()),
+            thunderbird_rhythm: false,
         }
     }
 
@@ -99,6 +126,7 @@ impl ClientConfig {
             max_literal: 64 * 1024 * 1024,
             proxy: None,
             identity: Some(default_identity()),
+            thunderbird_rhythm: false,
         }
     }
 
@@ -113,6 +141,7 @@ impl ClientConfig {
             max_literal: 16 * 1024 * 1024,
             proxy: None,
             identity: Some(default_identity()),
+            thunderbird_rhythm: false,
         }
     }
 
@@ -127,6 +156,15 @@ impl ClientConfig {
     #[must_use]
     pub fn with_max_literal(mut self, bytes: usize) -> Self {
         self.max_literal = bytes;
+        self
+    }
+
+    /// Enables Thunderbird's exact post-login command rhythm
+    /// (`ID` -> `NAMESPACE` -> `ENABLE` -> `SELECT INBOX`), so the wire
+    /// pattern matches a real Thunderbird session.
+    #[must_use]
+    pub fn with_thunderbird_rhythm(mut self) -> Self {
+        self.thunderbird_rhythm = true;
         self
     }
 
@@ -161,6 +199,7 @@ impl ClientConfig {
             host: host.into(),
             port,
             auth: None,
+            protocol: ProxyProtocol::Socks5,
         });
         self
     }
@@ -179,6 +218,38 @@ impl ClientConfig {
             host: host.into(),
             port,
             auth: Some((user.into(), password.into())),
+            protocol: ProxyProtocol::Socks5,
+        });
+        self
+    }
+
+    /// Tunnels the connection through an HTTP proxy with `CONNECT`.
+    #[must_use]
+    pub fn with_http_connect(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.proxy = Some(ProxyConfig {
+            host: host.into(),
+            port,
+            auth: None,
+            protocol: ProxyProtocol::HttpConnect,
+        });
+        self
+    }
+
+    /// Tunnels the connection through an HTTP proxy with `CONNECT` and Basic
+    /// authentication.
+    #[must_use]
+    pub fn with_http_connect_auth(
+        mut self,
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.proxy = Some(ProxyConfig {
+            host: host.into(),
+            port,
+            auth: Some((user.into(), password.into())),
+            protocol: ProxyProtocol::HttpConnect,
         });
         self
     }

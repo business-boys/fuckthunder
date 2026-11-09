@@ -33,7 +33,7 @@ struct Cli {
     /// Password (prefer the environment variable).
     #[arg(long, env = "FUCKTHUNDER_PASSWORD", default_value = "")]
     password: String,
-    /// SOCKS5 proxy as `socks5://[user:password@]host:port`.
+    /// Proxy as `socks5://[user:password@]host:port` or `http://[user:password@]host:port`.
     #[arg(long, env = "FUCKTHUNDER_PROXY")]
     proxy: Option<String>,
     #[command(subcommand)]
@@ -117,35 +117,45 @@ async fn main() -> Result<()> {
     }
 }
 
+fn apply_proxy(config: ClientConfig, proxy: &str) -> Result<ClientConfig> {
+    let url = url::Url::parse(proxy).context("parse --proxy")?;
+    let host = url.host_str().context("proxy host missing")?;
+    let user = url.username();
+    let password = url.password().unwrap_or_default();
+    let auth = (!user.is_empty()).then_some((user, password));
+    match url.scheme() {
+        "socks5" => {
+            let port = url.port().unwrap_or(1080);
+            Ok(match auth {
+                Some((user, password)) => config.with_socks5_auth(host, port, user, password),
+                None => config.with_socks5(host, port),
+            })
+        }
+        "http" => {
+            let port = url.port().unwrap_or(8080);
+            Ok(match auth {
+                Some((user, password)) => config.with_http_connect_auth(host, port, user, password),
+                None => config.with_http_connect(host, port),
+            })
+        }
+        _ => anyhow::bail!("--proxy must be socks5://... or http://..."),
+    }
+}
+
 async fn imap_command(cli: &Cli, command: Commands) -> Result<()> {
     let port = cli.port.unwrap_or(match cli.tls {
         Tls::Implicit => 993,
         Tls::Starttls | Tls::Plain => 143,
     });
     let config = match cli.tls {
-        Tls::Implicit => ClientConfig::tls(&cli.host),
-        Tls::Starttls => ClientConfig::starttls(&cli.host),
+        Tls::Implicit => ClientConfig::tls(&cli.host).with_thunderbird_rhythm(),
+        Tls::Starttls => ClientConfig::starttls(&cli.host).with_thunderbird_rhythm(),
         Tls::Plain => ClientConfig::plaintext(&cli.host, port),
     };
     let mut config = config.with_timeout(Duration::from_secs(30));
     config.port = port;
     if let Some(proxy) = &cli.proxy {
-        let url = url::Url::parse(proxy).context("parse --proxy")?;
-        anyhow::ensure!(url.scheme() == "socks5", "--proxy must be socks5://...");
-        let host = url.host_str().context("proxy host missing")?.to_string();
-        let port = url.port().unwrap_or(1080);
-        config.proxy = Some(fuckthunder_imap::ProxyConfig {
-            host,
-            port,
-            auth: if url.username().is_empty() {
-                None
-            } else {
-                Some((
-                    url.username().to_string(),
-                    url.password().unwrap_or_default().to_string(),
-                ))
-            },
-        });
+        config = apply_proxy(config, proxy)?;
     }
 
     let mut client = ImapClient::connect(config).await.context("connect")?;
@@ -247,4 +257,39 @@ async fn oauth(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuckthunder_imap::ProxyProtocol;
+
+    #[test]
+    fn parses_http_proxy_with_basic_auth() {
+        let config = apply_proxy(
+            ClientConfig::tls("imap.example.org"),
+            "http://user:pass@proxy.example.org:3128",
+        )
+        .unwrap();
+        let proxy = config.proxy.unwrap();
+        assert_eq!(proxy.protocol, ProxyProtocol::HttpConnect);
+        assert_eq!(proxy.host, "proxy.example.org");
+        assert_eq!(proxy.port, 3128);
+        assert_eq!(proxy.auth, Some(("user".into(), "pass".into())));
+    }
+
+    #[test]
+    fn preserves_socks5_proxy_support() {
+        let config =
+            apply_proxy(ClientConfig::tls("imap.example.org"), "socks5://proxy:1080").unwrap();
+        let proxy = config.proxy.unwrap();
+        assert_eq!(proxy.protocol, ProxyProtocol::Socks5);
+        assert_eq!(proxy.port, 1080);
+        assert!(proxy.auth.is_none());
+    }
+
+    #[test]
+    fn rejects_unsupported_proxy_scheme() {
+        assert!(apply_proxy(ClientConfig::tls("imap.example.org"), "https://proxy:8080").is_err());
+    }
 }

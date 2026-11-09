@@ -8,6 +8,7 @@ description = "Async safe-Rust IMAP client with TLS, STARTTLS, compression, IDLE
 
 [dependencies]
 async-compression = { version = "0.4", features = ["tokio", "zlib"] }
+base64.workspace = true
 fuckthunder-core.workspace = true
 fuckthunder-imap-proto.workspace = true
 fuckthunder-sasl.workspace = true

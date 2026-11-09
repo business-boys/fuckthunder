@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use fuckthunder_core::{
     CapabilitySet, Error, FlagSet, MailboxName, ResponseCode, Result, SequenceSet, StatusData,
-    StatusItem,
+    StatusItem, TaggedStatus,
 };
 use fuckthunder_imap_proto::{
     Command, FetchData, FetchItems, ListEntry, NamespaceResponse, Response, SearchQuery,
@@ -34,6 +34,7 @@ use crate::types::{ClientConfig, SelectInfo, State};
 pub struct ImapClient {
     connection: Connection,
     identity: Option<Vec<(String, String)>>,
+    thunderbird_rhythm: bool,
 }
 
 impl ImapClient {
@@ -52,6 +53,7 @@ impl ImapClient {
         Ok(Self {
             connection,
             identity: config.identity.clone(),
+            thunderbird_rhythm: config.thunderbird_rhythm,
         })
     }
 
@@ -99,8 +101,23 @@ impl ImapClient {
     ///
     /// Fails when the server rejects the credentials.
     pub async fn login(&mut self, user: &str, password: &str) -> Result<()> {
-        self.connection.login(user, password).await?;
-        self.maybe_id().await
+        match self.connection.login(user, password).await {
+            Ok(()) => {}
+            Err(Error::Server { status, text, .. })
+                if status == TaggedStatus::Bad
+                    || (status == TaggedStatus::No
+                        && text.contains("Authentication mechanism not supported")) =>
+            {
+                // Some DACH servers reject non-ASCII quoted LOGIN arguments with
+                // BAD, or disable LOGIN entirely, but accept SASL PLAIN.
+                let credentials = Credentials::password(user, password);
+                let mut mechanism = fuckthunder_sasl::Plain::new(&credentials);
+                self.connection.authenticate(&mut mechanism).await?;
+            }
+            Err(error) => return Err(error),
+        }
+        self.maybe_id().await?;
+        self.maybe_thunderbird_rhythm().await
     }
 
     /// Authenticates with an explicit SASL mechanism.
@@ -110,7 +127,8 @@ impl ImapClient {
     /// Fails when the exchange is rejected.
     pub async fn authenticate(&mut self, mechanism: &mut dyn Mechanism) -> Result<()> {
         self.connection.authenticate(mechanism).await?;
-        self.maybe_id().await
+        self.maybe_id().await?;
+        self.maybe_thunderbird_rhythm().await
     }
 
     /// Authenticates with an OAuth bearer token, preferring `OAUTHBEARER` and
@@ -154,6 +172,29 @@ impl ImapClient {
         Ok(Vec::new())
     }
 
+    /// Reproduces the exact command sequence Thunderbird issues right after
+    /// authentication: `NAMESPACE`, `ENABLE` (QRESYNC/CONDSTORE when
+    /// advertised) and `SELECT INBOX`. Capability-driven, so it degrades
+    /// gracefully on servers without the extensions.
+    async fn maybe_thunderbird_rhythm(&mut self) -> Result<()> {
+        if !self.thunderbird_rhythm {
+            return Ok(());
+        }
+        if self.capabilities().has("NAMESPACE") {
+            self.namespace().await?;
+        }
+        let enable: Vec<&str> = ["QRESYNC", "CONDSTORE"]
+            .into_iter()
+            .filter(|cap| self.capabilities().has(cap))
+            .collect();
+        if !enable.is_empty() {
+            self.enable(&enable).await?;
+        }
+        let inbox = MailboxName::from_utf8("INBOX")?;
+        self.select(&inbox, false).await?;
+        Ok(())
+    }
+
     /// Sends the configured `ID` after authentication when the server
     /// advertises the extension (mirrors Thunderbird's behaviour).
     async fn maybe_id(&mut self) -> Result<()> {
@@ -167,7 +208,9 @@ impl ImapClient {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        self.id(&refs).await?;
+        // ID is optional post-login metadata. Some servers advertise it but reject
+        // the command; authentication has already succeeded and must remain usable.
+        let _ = self.id(&refs).await;
         Ok(())
     }
 

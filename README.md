@@ -20,8 +20,9 @@ manual memory management — memory safety is enforced by the compiler.
 | `fuckthunder-imap-proto` | Zero-copy tokenizer, typed response parser, command encoder, SEARCH builder, FETCH/BODYSTRUCTURE, allocation-free scanner |
 | `fuckthunder-sasl` | PLAIN, LOGIN, CRAM-MD5, XOAUTH2, OAUTHBEARER, ANONYMOUS, EXTERNAL |
 | `fuckthunder-oauth` | PKCE, authorization-code/refresh/device flows, loopback redirect listener, token store |
-| `fuckthunder-imap` | Transport (TLS / STARTTLS / DEFLATE / **SOCKS5**), connection framing, high-level `ImapClient` |
+| `fuckthunder-imap` | Transport (TLS / STARTTLS / DEFLATE / **SOCKS5 / HTTP CONNECT**), connection framing, high-level `ImapClient` |
 | `fuckthunder-cli` | `fuckthunder` command-line client |
+| `fuckthunder-gui` | GPUI batch account checker and read-only, paginated mail viewer |
 | `fuckthunder-tools` | `fh-parity` (A/B differential harness) + `fh-bench` |
 
 ## Usage
@@ -64,6 +65,19 @@ let config = ClientConfig::tls("imap.example.org")
     .with_socks5("127.0.0.1", 1080);                                  // no auth
 let config = ClientConfig::tls("imap.example.org")
     .with_socks5_auth("proxy.host", 1080, "user", "password");        // RFC 1929
+```
+
+### Through an HTTP CONNECT proxy
+
+The proxy establishes a TCP tunnel to the IMAP endpoint; implicit TLS still
+terminates at that endpoint. Optional Basic authentication is sent only to the
+proxy during `CONNECT`.
+
+```rust
+let config = ClientConfig::tls("imap.example.org")
+    .with_http_connect("127.0.0.1", 8080);                             // no auth
+let config = ClientConfig::tls("imap.example.org")
+    .with_http_connect_auth("proxy.host", 8080, "user", "password");  // Basic auth
 ```
 
 ### Reading mail
@@ -140,10 +154,34 @@ fuckthunder --host secureimap.t-online.de \
   --proxy socks5://user:pass@proxy:1080 \
   --user alice@example.org --password '...' \
   list            # capability | login | list | select | fetch 1:10 | search UNSEEN | idle
+
+fuckthunder --host secureimap.t-online.de \
+  --proxy http://user:pass@proxy:8080 \
+  --user alice@example.org --password '...' \
+  list            # capability | login | list | select | fetch 1:10 | search UNSEEN | idle
 ```
 
 Env vars: `FUCKTHUNDER_HOST`, `FUCKTHUNDER_PORT`, `FUCKTHUNDER_USER`,
 `FUCKTHUNDER_PASSWORD`, `FUCKTHUNDER_PROXY`.
+
+## GPUI checker and mail viewer
+
+```bash
+cargo run -p fuckthunder-gui -- accounts.txt --concurrency 8
+# Optional per-process SOCKS5H or HTTP CONNECT proxy:
+cargo run -p fuckthunder-gui -- accounts.txt --proxy socks5://user:pass@proxy:1080
+```
+
+The input is UTF-8 `email:password` text (CRLF accepted, passwords may contain
+colons), limited to 8 MiB. Credentials stay in process memory and are redacted
+from `Debug`; the application does not create an account/result database.
+
+The first vertical slice provides bounded account checks, selectable folders,
+50-message pages and lazy MIME/plain-text message rendering. GMX and WEB.DE IMAP
+hosts are inferred automatically; other domains use `imap.<domain>`. All mailbox
+selection uses `EXAMINE`, and full messages use `BODY.PEEK[]`: the GUI has no
+delete, flag-update, send or IMAP-enable operations. HTML is deliberately not
+executed or rendered. Account lists use GPUI virtualized rendering.
 
 ## Development
 

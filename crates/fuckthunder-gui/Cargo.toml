@@ -1,0 +1,27 @@
+[package]
+name = "fuckthunder-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read-only GPUI IMAP account checker and mail viewer"
+
+[lib]
+name = "fuckthunder_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuckthunder-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fuckthunder-core.workspace = true
+fuckthunder-imap.workspace = true
+fuckthunder-imap-proto.workspace = true
+futures = "0.3"
+gpui = "0.2.2"
+mailparse = "0.16"
+tokio.workspace = true
+url.workspace = true

@@ -383,6 +383,50 @@ async fn full_session_against_mock_server() {
 }
 
 #[tokio::test]
+async fn login_falls_back_to_plain_when_login_is_disabled() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(socket);
+        io.write_all(format!("* OK [CAPABILITY {CAPS}] mock ready\r\n").as_bytes())
+            .await
+            .unwrap();
+        let (tag, _text) = read_command(&mut io).await; // CAPABILITY
+        reply(&mut io, &tag, &[&format!("* CAPABILITY {CAPS}\r\n")], "OK").await;
+        let (tag, text) = read_command(&mut io).await;
+        assert!(text.contains("LOGIN"));
+        reply(
+            &mut io,
+            &tag,
+            &[],
+            "NO Authentication mechanism not supported",
+        )
+        .await;
+        let (tag, text) = read_command(&mut io).await;
+        assert!(text.contains("AUTHENTICATE PLAIN"));
+        reply(&mut io, &tag, &[], "OK authenticated").await;
+        loop {
+            let (tag, text) = read_command(&mut io).await;
+            if text.contains("ID") {
+                reply(&mut io, &tag, &["* ID NIL\r\n"], "OK").await;
+                continue;
+            }
+            assert!(text.contains("LOGOUT"));
+            reply(&mut io, &tag, &["* BYE bye\r\n"], "OK logout completed").await;
+            break;
+        }
+    });
+
+    let config = ClientConfig::plaintext("127.0.0.1", port).with_timeout(Duration::from_secs(5));
+    let mut client = ImapClient::connect(config).await.unwrap();
+    client.login("alice", "hunter2").await.unwrap();
+    assert_eq!(client.state(), &State::Authenticated);
+    client.logout().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn sasl_cram_md5_over_mock_server() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -567,6 +611,62 @@ async fn idle_until_matches_event() {
         .idle_until(Duration::from_millis(300), |_| None)
         .await;
     assert!(matches!(result, Err(fuckthunder_core::Error::Timeout)));
+    client.logout().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn thunderbird_rhythm_matches_reference_order() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let caps = "IMAP4rev1 UIDPLUS IDLE ENABLE CONDSTORE QRESYNC NAMESPACE ID AUTH=PLAIN";
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut io = BufReader::new(socket);
+        io.write_all(format!("* OK [CAPABILITY {caps}] mock ready\r\n").as_bytes())
+            .await
+            .unwrap();
+        let expect = [
+            ("CAPABILITY", format!("* CAPABILITY {caps}\r\n"), "OK"),
+            ("LOGIN", String::new(), "OK login"),
+            (" ID ", "* ID NIL\r\n".to_string(), "OK id"),
+            (
+                "NAMESPACE",
+                "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n".to_string(),
+                "OK namespace",
+            ),
+            (
+                "ENABLE",
+                "* ENABLED QRESYNC CONDSTORE\r\n".to_string(),
+                "OK enabled",
+            ),
+            (
+                "SELECT",
+                "* 1 EXISTS\r\n".to_string(),
+                "OK [READ-WRITE] selected",
+            ),
+            ("LOGOUT", "* BYE bye\r\n".to_string(), "OK"),
+        ];
+        for (needle, untagged, tagged) in expect {
+            let (tag, text) = read_command(&mut io).await;
+            assert!(
+                text.to_ascii_uppercase().contains(needle),
+                "expected {needle}, got {text}"
+            );
+            let lines: Vec<&str> = if untagged.is_empty() {
+                Vec::new()
+            } else {
+                vec![untagged.as_str()]
+            };
+            reply(&mut io, &tag, &lines, tagged).await;
+        }
+    });
+
+    let config = ClientConfig::plaintext("127.0.0.1", port)
+        .with_timeout(Duration::from_secs(5))
+        .with_thunderbird_rhythm();
+    let mut client = ImapClient::connect(config).await.unwrap();
+    client.login("a", "b").await.unwrap();
     client.logout().await.unwrap();
     server.await.unwrap();
 }

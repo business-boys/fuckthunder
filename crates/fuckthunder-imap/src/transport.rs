@@ -90,9 +90,18 @@ impl Transport {
             .map_err(Error::Io)?;
         tcp.set_nodelay(true).map_err(Error::Io)?;
         if let Some(proxy) = proxy {
-            tokio::time::timeout(timeout, socks5_handshake(&mut tcp, proxy, host, port))
-                .await
-                .map_err(|_| Error::Timeout)??;
+            tokio::time::timeout(timeout, async {
+                match proxy.protocol {
+                    crate::types::ProxyProtocol::Socks5 => {
+                        socks5_handshake(&mut tcp, proxy, host, port).await
+                    }
+                    crate::types::ProxyProtocol::HttpConnect => {
+                        http_connect_handshake(&mut tcp, proxy, host, port).await
+                    }
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout)??;
         }
         match mode {
             TlsMode::Plain | TlsMode::StartTls => Ok(Self {
@@ -234,6 +243,69 @@ impl AsyncWrite for Transport {
     }
 }
 
+/// Establishes an HTTP CONNECT tunnel without buffering bytes past the header.
+async fn http_connect_handshake(
+    tcp: &mut TcpStream,
+    proxy: &crate::types::ProxyConfig,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const MAX_RESPONSE_HEADER: usize = 16 * 1024;
+
+    let authority = match host.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{host}]:{port}"),
+        Err(_) => format!("{host}:{port}"),
+    };
+    let mut request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n"
+    );
+    if let Some((user, password)) = &proxy.auth {
+        let credentials = base64::engine::general_purpose::STANDARD
+            .encode(format!("{user}:{password}").as_bytes());
+        request.push_str(&format!("Proxy-Authorization: Basic {credentials}\r\n"));
+    }
+    request.push_str("\r\n");
+    tcp.write_all(request.as_bytes()).await.map_err(Error::Io)?;
+
+    let mut response = Vec::with_capacity(256);
+    while !response.ends_with(b"\r\n\r\n") {
+        if response.len() == MAX_RESPONSE_HEADER {
+            return Err(Error::Limit(
+                "HTTP proxy response header is too large".into(),
+            ));
+        }
+        let mut byte = [0u8; 1];
+        tcp.read_exact(&mut byte).await.map_err(Error::Io)?;
+        response.push(byte[0]);
+    }
+    let header = std::str::from_utf8(&response)
+        .map_err(|_| Error::Protocol("HTTP proxy response is not valid ASCII".into()))?;
+    let status_line = header
+        .split("\r\n")
+        .next()
+        .ok_or_else(|| Error::Protocol("HTTP proxy response has no status line".into()))?;
+    let mut fields = status_line.split_whitespace();
+    let version = fields.next().unwrap_or_default();
+    let status = fields
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| Error::Protocol("HTTP proxy sent a malformed status line".into()))?;
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(Error::Protocol(
+            "HTTP proxy sent an unsupported version".into(),
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "HTTP proxy CONNECT failed with status {status}"
+        ))));
+    }
+    Ok(())
+}
+
 /// Performs the SOCKS5 handshake (RFC 1928/1929) towards `host:port`.
 async fn socks5_handshake(
     tcp: &mut TcpStream,
@@ -341,6 +413,131 @@ mod tests {
     fn tls_config_builds() {
         let config = client_config().unwrap();
         assert!(!config.alpn_protocols.is_empty() || config.alpn_protocols.is_empty());
+    }
+
+    fn http_proxy(port: u16, auth: Option<(&str, &str)>) -> crate::types::ProxyConfig {
+        crate::types::ProxyConfig {
+            host: "127.0.0.1".into(),
+            port,
+            auth: auth.map(|(user, password)| (user.into(), password.into())),
+            protocol: crate::types::ProxyProtocol::HttpConnect,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_connect_succeeds_without_consuming_tunnel_bytes() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("CONNECT imap.example.org:993 HTTP/1.1\r\n"));
+            assert!(request.contains("Host: imap.example.org:993\r\n"));
+            assert!(!request.contains("Proxy-Authorization"));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\nTLS")
+                .await
+                .unwrap();
+        });
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        http_connect_handshake(&mut tcp, &http_proxy(port, None), "imap.example.org", 993)
+            .await
+            .unwrap();
+        use tokio::io::AsyncReadExt;
+        let mut tunnel_bytes = [0u8; 3];
+        tcp.read_exact(&mut tunnel_bytes).await.unwrap();
+        assert_eq!(&tunnel_bytes, b"TLS");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connect_sends_basic_auth() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        http_connect_handshake(
+            &mut tcp,
+            &http_proxy(port, Some(("user", "pass"))),
+            "imap.example.org",
+            993,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_non_success_status() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let error =
+            http_connect_handshake(&mut tcp, &http_proxy(port, None), "imap.example.org", 993)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("status 407"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_malformed_response() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"NOT HTTP\r\n\r\n").await.unwrap();
+        });
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let error =
+            http_connect_handshake(&mut tcp, &http_proxy(port, None), "imap.example.org", 993)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)));
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -42,4 +42,4 @@ pub mod types;
 pub use client::ImapClient;
 pub use connection::{CommandOutcome, Connection};
 pub use transport::{client_config, TlsMode, Transport};
-pub use types::{ClientConfig, ProxyConfig, SelectInfo, State};
+pub use types::{ClientConfig, ProxyConfig, ProxyProtocol, SelectInfo, State};
