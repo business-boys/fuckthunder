@@ -363,7 +363,8 @@ impl Render for MailApp {
                     })
                     .collect()
             }
-        });
+        })
+        .h_full();
 
         let folders_list = uniform_list("folders", self.folders.len(), {
             let app = app.clone();
@@ -396,7 +397,8 @@ impl Render for MailApp {
                     })
                     .collect()
             }
-        });
+        })
+        .h_full();
 
         let messages_list = uniform_list("messages", self.page.messages.len(), {
             let app = app.clone();
@@ -412,7 +414,8 @@ impl Render for MailApp {
                     })
                     .collect()
             }
-        });
+        })
+        .h_full();
 
         let detail = self.detail.as_ref().map_or_else(
             || {
