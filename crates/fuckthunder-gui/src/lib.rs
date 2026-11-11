@@ -12,6 +12,12 @@ use futures::{stream, StreamExt};
 use mailparse::{MailHeaderMap, ParsedMail};
 use tokio::sync::mpsc;
 
+pub mod api;
+mod store;
+
+pub use api::{ApiError, ApiServer, ApiStatus};
+pub use store::{ImportSummary, ProxyRecord, RunSummary, Store, StoredAccount, WorkspaceSettings};
+
 /// Number of message summaries fetched for one page.
 pub const PAGE_SIZE: usize = 50;
 

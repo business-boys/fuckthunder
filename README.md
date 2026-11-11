@@ -167,23 +167,56 @@ Env vars: `FUCKTHUNDER_HOST`, `FUCKTHUNDER_PORT`, `FUCKTHUNDER_USER`,
 ## GPUI checker and mail viewer
 
 ```bash
-cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt --concurrency 8
-# Optional per-process SOCKS5H or HTTP CONNECT proxy:
-cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt --proxy socks5://user:pass@proxy:1080
+# Full GUI; no file or other CLI argument is required.
+cargo run -p fuckthunder-gui --bin fuckthunder-gui
+# Optional startup import and custom database:
+cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt \
+  --database ./workspace.db --concurrency 8
 # Headless batch-only driver:
 cargo run -p fuckthunder-gui --bin fuckthunder-check -- accounts.txt --concurrency 10
 ```
 
-The input is UTF-8 `email:password` text (CRLF accepted, passwords may contain
-colons), limited to 8 MiB. Credentials stay in process memory and are redacted
-from `Debug`; the application does not create an account/result database.
+The GUI imports UTF-8 `email:password` files through a native file picker (CRLF
+accepted, passwords may contain colons, files up to 16 MiB). Paste account rows
+directly with **Ctrl+V** on Linux/Windows or **Cmd+V** on macOS; the same shortcut
+imports proxy rows in **Proxy routes**, and pastes normally into account search.
+The proxy importer accepts `socks5://`/`http://` URLs and
+`host:port:user:password` rows. Accounts are checked with bounded, adjustable
+concurrency and round-robin proxy assignment; batches can be stopped, failed
+accounts retried and verdicts reset.
+The account workspace includes keyboard search, status/route filters, 25-row
+pages, quick `4 / 8 / 16 / 32 / 64` thread presets and live determinate progress.
+Its sidebar navigation and subtle GPUI animations do not require a background
+redraw timer; large account, message, proxy and history lists stay virtualized.
+The interface uses the bundled Onest variable font (SIL Open Font License; see
+`crates/fuckthunder-gui/assets/OFL-Onest.txt`).
 
-The first vertical slice provides bounded account checks, selectable folders,
-50-message pages and lazy MIME/plain-text message rendering. GMX and WEB.DE IMAP
-hosts are inferred automatically; other domains use `imap.<domain>`. All mailbox
-selection uses `EXAMINE`, and full messages use `BODY.PEEK[]`: the GUI has no
-delete, flag-update, send or IMAP-enable operations. HTML is deliberately not
-executed or rendered. Account lists use GPUI virtualized rendering.
+The local SQLite workspace stores accounts, proxy settings, per-account verdicts
+and timestamps, plus the latest 100 aggregated runs shown in **History**. The
+default path is `~/Library/Application Support/FuckThunder/workspace.db` on
+macOS and `~/.local/share/fuckthunder/workspace.db` elsewhere. Credentials are
+stored locally in plaintext for subsequent IMAP sessions: protect the database
+like a password file. On Unix the GUI restricts it to mode `0600`; proxy
+credentials are never rendered in the UI.
+
+**Settings & API** persists thread count, IMAP timeout and API preferences. The
+embedded server binds only to `127.0.0.1` (default port `8765`), can be started
+at application launch or from the GUI, and provides URL/token copy controls.
+`GET /health` is public; all other routes require `Authorization: Bearer <token>`.
+Available routes are `GET /api/v1/stats`, account/proxy list, import, delete and
+clear operations, `GET /api/v1/runs`, `POST /api/v1/checks`,
+`POST /api/v1/results/reset`, and `DELETE /api/v1/history`. Imports accept raw
+UTF-8 text, a JSON string or `{ "text": "..." }`. Responses omit account
+passwords and proxy credentials. Destructive operations return HTTP 409 while a
+check is active. The same screen provides guarded account, proxy, history and
+verdict cleanup controls.
+
+Folders, 50-message pages and lazy MIME/plain-text rendering remain read-only.
+GMX and WEB.DE IMAP hosts are inferred automatically; other domains use
+`imap.<domain>`. All mailbox selection uses `EXAMINE`, and full messages use
+`BODY.PEEK[]`: there are no delete, flag-update, send or IMAP-enable operations.
+HTML is deliberately not executed or rendered. Large lists use GPUI virtualized
+rendering.
 
 ## Development
 
