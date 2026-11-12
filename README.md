@@ -164,7 +164,7 @@ fuckthunder --host secureimap.t-online.de \
 Env vars: `FUCKTHUNDER_HOST`, `FUCKTHUNDER_PORT`, `FUCKTHUNDER_USER`,
 `FUCKTHUNDER_PASSWORD`, `FUCKTHUNDER_PROXY`.
 
-## GPUI checker and mail viewer
+## Hakus mail client and account checker
 
 ```bash
 # Full GUI; no file or other CLI argument is required.
@@ -176,10 +176,65 @@ cargo run -p fuckthunder-gui --bin fuckthunder-gui -- accounts.txt \
 cargo run -p fuckthunder-gui --bin fuckthunder-check -- accounts.txt --concurrency 10
 ```
 
-The GUI imports UTF-8 `email:password` files through a native file picker (CRLF
-accepted, passwords may contain colons, files up to 16 MiB). Paste account rows
-directly with **Ctrl+V** on Linux/Windows or **Cmd+V** on macOS; the same shortcut
-imports proxy rows in **Proxy routes**, and pastes normally into account search.
+### Install Hakus on macOS
+
+Build and install the native app for your Mac's architecture:
+
+```bash
+tools/macos/package.sh --install
+open "$HOME/Applications/Hakus.app"
+```
+
+The script builds a release binary, creates `Hakus.app` with an icon, applies an
+ad-hoc signature, and installs it in `~/Applications`. Launch it from Finder or
+Spotlight, or choose **Options → Keep in Dock** from its Dock menu. Quit Hakus
+before reinstalling. The installer keeps an existing app as a timestamped backup.
+
+Without `--install`, the script writes the bundle and a ZIP to `target/macos/`.
+This is a local ad-hoc build, not an Apple-notarized public release. The bundle
+requires macOS 12 or later. Building requires Rust, Xcode with the Metal toolchain,
+Python 3, and the Xcode command-line tools.
+
+The app keeps existing workspace data in
+`~/Library/Application Support/FuckThunder/workspace.db`. Installing or replacing
+the app does not remove accounts or settings. Passwords remain in local SQLite,
+not macOS Keychain.
+
+The desktop app opens in compact **Mail client** mode with separate **Email**
+and **Password** fields. Enter them separately and press **Enter**, or paste an
+`email:password` row into either field with **Cmd+V** on macOS or **Ctrl+V**
+elsewhere. A combined row splits on the first colon and connects immediately;
+passwords may contain additional colons. The login screen has no sidebar. After
+connecting, a narrow folder panel appears and INBOX opens automatically.
+**Advanced** exposes a server override, port, TLS/STARTTLS and an optional
+SOCKS5/HTTP CONNECT proxy. Successful connections are saved in the local SQLite
+workspace, including the password. **+ Add mailbox** opens an independent tab.
+Keep several mailboxes open and switch tabs without resetting their folder,
+page, or open message. The tab strip scrolls and includes an overflow menu.
+Close a tab with **×**. Closing the last tab opens a fresh connection form.
+Saved mailboxes appear below the tab strip and reopen without duplicate tabs.
+**Refresh** reloads the current folder, **Disconnect** returns to the connection
+form, and **Cancel** stops an active request in that tab.
+
+At the default window size, folders, messages and the reader stay in separate
+columns. **+ Add mailbox** stays at the top beside the tabs. The compact toolbar
+contains search, pagination, Refresh and Disconnect. **Cmd+Q** quits on macOS
+and **Ctrl+Q** quits elsewhere, cancelling active requests.
+
+The reader uses one authenticated read-only IMAP session per tab, rejects stale
+request results. Drag the dividers to resize the folder, message and reader
+panels. **Search this folder** searches all matching messages on the server.
+**Retry** repeats a failed request, and **Copy message** copies the visible text.
+It does not send mail, change flags, or provide OAuth login. Providers that
+disable password login require a supported app password or another client.
+
+Select **Account checker** for file imports, batch checks, history, proxies and
+workspace settings. Client mode does not run a batch before opening a mailbox.
+
+The checker imports UTF-8 `email:password` files through a native file picker
+(CRLF accepted, passwords may contain colons, files up to 16 MiB). Paste account
+rows with **Ctrl+V** on Linux/Windows or **Cmd+V** on macOS. In **Proxy routes**,
+the shortcut imports proxies. In client text fields, it pastes text normally.
 The proxy importer accepts `socks5://`/`http://` URLs and
 `host:port:user:password` rows. Accounts are checked with bounded, adjustable
 concurrency and round-robin proxy assignment; batches can be stopped, failed
@@ -212,11 +267,21 @@ check is active. The same screen provides guarded account, proxy, history and
 verdict cleanup controls.
 
 Folders, 50-message pages and lazy MIME/plain-text rendering remain read-only.
-GMX and WEB.DE IMAP hosts are inferred automatically; other domains use
-`imap.<domain>`. All mailbox selection uses `EXAMINE`, and full messages use
+Common provider hosts are inferred automatically. Unknown domains default to
+`imap.<domain>` and can use an explicit host in the client form.
+TLS certificates remain verified, including for explicit servers and proxies.
+All mailbox selection uses `EXAMINE`, and full messages use
 `BODY.PEEK[]`: there are no delete, flag-update, send or IMAP-enable operations.
-HTML is deliberately not executed or rendered. Large lists use GPUI virtualized
-rendering.
+The message viewer uses a native WebView for HTML/CSS, selectable wrapped text
+and message source. Its header stays outside the body. Text, HTML, source, full headers, `.eml`
+export, attachment save/open, and detached viewing share one viewer component.
+Mailbox panels have draggable dividers. CID images use decoded MIME resources.
+External images stay blocked until explicitly enabled. Scripts and forms remain
+blocked. Links open in the system browser. Open a local message with
+`fuckthunder-gui --message message.eml`.
+
+Opening an attachment writes a temporary copy for its default application.
+The account checker searches subject, sender and body across folders.
 
 ## Development
 

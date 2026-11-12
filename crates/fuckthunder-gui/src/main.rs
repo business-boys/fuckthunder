@@ -1,5 +1,7 @@
 //! Persistent GPUI desktop client for read-only IMAP checking and mail viewing.
 
+mod client;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -10,19 +12,25 @@ use std::{
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
-use fuckthunder_core::Error;
 use fuckthunder_gui::{
-    check_account, load_folders, load_message, load_page, parse_proxy, Account, ApiServer,
-    CheckStatus, ImportSummary, MessagePage, MessageSummary, MessageView, ProxyRecord, RunSummary,
-    SessionOptions, Store, StoredAccount, WorkspaceSettings, PAGE_SIZE,
+    check_account, parse_proxy, search_account_mail, Account, ApiServer, CheckStatus,
+    ImportSummary, MailHit, ProxyRecord, RunSummary, SessionOptions, Store, StoredAccount,
+    WorkspaceSettings,
 };
 use futures::{stream, StreamExt};
 use gpui::{
     bounce, div, ease_in_out, prelude::*, px, relative, rgb, size, uniform_list, Animation,
-    AnimationExt as _, Application, Bounds, ClipboardItem, Context, FontWeight, KeyDownEvent,
-    MouseButton, PathPromptOptions, SharedString, Window, WindowBounds, WindowOptions,
+    AnimationExt as _, Application, Bounds, ClipboardItem, Context, FontWeight, KeyBinding,
+    KeyDownEvent, Menu, MenuItem, MouseButton, PathPromptOptions, SharedString, Window,
+    WindowBounds, WindowOptions,
+};
+use gpui_component::{
+    button::{Button, ButtonVariants},
+    Root, Theme, ThemeMode,
 };
 use tokio::{runtime::Runtime, sync::mpsc, task::AbortHandle};
+
+gpui::actions!(hakus, [Quit]);
 
 const fn rgba(hex: u32) -> gpui::Rgba {
     gpui::Rgba {
@@ -57,6 +65,9 @@ const ACCOUNT_PAGE_SIZE: usize = 25;
 struct Args {
     /// Optional account file to import at startup; the GUI also has an Import button.
     file: Option<PathBuf>,
+    /// RFC 5322 message file to open without an IMAP connection.
+    #[arg(long)]
+    message: Option<PathBuf>,
     /// SQLite database path.
     #[arg(long)]
     database: Option<PathBuf>,
@@ -121,6 +132,7 @@ struct MailApp {
     runtime: Arc<Runtime>,
     store: Arc<Store>,
     database_path: PathBuf,
+    client: gpui::Entity<client::Client>,
     concurrency: usize,
     settings: WorkspaceSettings,
     api_server: Option<ApiServer>,
@@ -134,18 +146,16 @@ struct MailApp {
     proxies: Vec<ProxyRecord>,
     runs: Vec<RunSummary>,
     selected_account: Option<usize>,
-    folders: Vec<String>,
-    selected_folder: Option<String>,
-    page: MessagePage,
-    selected_message: Option<u32>,
-    detail: Option<MessageView>,
     checking: bool,
     active_run: Option<i64>,
     run_completed: usize,
     run_total: usize,
     batch_abort: Option<AbortHandle>,
-    busy: bool,
     notice: String,
+    mail_query: String,
+    mail_query_focus: gpui::FocusHandle,
+    mail_hits: Vec<(String, MailHit)>,
+    mail_scanning: bool,
 }
 
 impl MailApp {
@@ -154,6 +164,7 @@ impl MailApp {
         store: Arc<Store>,
         database_path: PathBuf,
         concurrency: usize,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let settings = store.workspace_settings().unwrap_or(WorkspaceSettings {
@@ -163,16 +174,18 @@ impl MailApp {
             api_port: 8765,
             api_token: String::new(),
         });
+        let client = cx.new(|cx| client::Client::new(runtime.clone(), store.clone(), window, cx));
         let concurrency = settings.concurrency.clamp(1, 64);
         let mut app = Self {
             runtime,
             store,
             database_path,
+            client,
             concurrency,
             settings,
             api_server: None,
             reveal_api_token: false,
-            workspace: Workspace::Accounts,
+            workspace: Workspace::Mail,
             account_filter: AccountFilter::All,
             account_page: 0,
             search: String::new(),
@@ -181,19 +194,27 @@ impl MailApp {
             proxies: Vec::new(),
             runs: Vec::new(),
             selected_account: None,
-            folders: Vec::new(),
-            selected_folder: None,
-            page: MessagePage::default(),
-            selected_message: None,
-            detail: None,
             checking: false,
             active_run: None,
             run_completed: 0,
             run_total: 0,
             batch_abort: None,
-            busy: false,
             notice: "Local workspace ready · import accounts to begin".into(),
+            mail_query: String::new(),
+            mail_query_focus: cx.focus_handle(),
+            mail_hits: Vec::new(),
+            mail_scanning: false,
         };
+        cx.on_app_quit(|app, cx| {
+            if let Some(abort) = app.batch_abort.take() {
+                abort.abort();
+            }
+            app.client
+                .update(cx, |client, cx| client.cancel_operations(cx));
+            app.api_server.take();
+            async {}
+        })
+        .detach();
         app.reload_data();
         app.notice = format!(
             "Workspace restored · {} accounts · {} proxies",
@@ -258,11 +279,13 @@ impl MailApp {
     }
 
     fn clear_data(&mut self, kind: ImportKind, cx: &mut Context<Self>) {
-        if self.checking || self.busy {
+        if self.checking {
             self.notice = "Stop active work before clearing data".into();
             cx.notify();
             return;
         }
+        self.client
+            .update(cx, |client, cx| client.cancel_operations(cx));
         let result = match kind {
             ImportKind::Accounts => self.store.clear_accounts(),
             ImportKind::Proxies => self.store.clear_proxies(),
@@ -270,9 +293,9 @@ impl MailApp {
         match result {
             Ok(count) => {
                 self.selected_account = None;
-                self.detail = None;
-                self.page = MessagePage::default();
                 self.reload_data();
+                self.client
+                    .update(cx, |client, cx| client.refresh_accounts(cx));
                 self.notice = format!("Removed {count} local records");
             }
             Err(error) => self.notice = format!("Cleanup failed: {error}"),
@@ -398,13 +421,9 @@ impl MailApp {
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
         let kind = match self.workspace {
-            Workspace::Accounts | Workspace::Mail | Workspace::History => ImportKind::Accounts,
+            Workspace::Accounts | Workspace::History => ImportKind::Accounts,
             Workspace::Proxies => ImportKind::Proxies,
-            Workspace::Settings => {
-                self.notice = "Switch to Accounts or Proxy routes to paste a list".into();
-                cx.notify();
-                return;
-            }
+            Workspace::Mail | Workspace::Settings => return,
         };
         match cx.read_from_clipboard().and_then(|item| item.text()) {
             Some(input) => self.import_text(kind, input, cx),
@@ -557,6 +576,88 @@ impl MailApp {
         }
     }
 
+    fn search_mail(&mut self, cx: &mut Context<Self>) {
+        let query = self.mail_query.trim().to_owned();
+        if query.is_empty() {
+            self.notice = "Enter a word or phrase to search mail".into();
+            cx.notify();
+            return;
+        }
+        if self.checking || self.mail_scanning {
+            self.notice = "Wait for the current run to finish".into();
+            cx.notify();
+            return;
+        }
+        let targets: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|row| (row.account.clone(), row.proxy_id))
+            .collect();
+        if targets.is_empty() {
+            self.notice = "Import accounts before searching mail".into();
+            cx.notify();
+            return;
+        }
+        self.mail_scanning = true;
+        self.mail_hits.clear();
+        self.notice = format!(
+            "Searching mail for \"{query}\" across {} accounts",
+            targets.len()
+        );
+        let timeout = Duration::from_secs(self.settings.timeout_seconds);
+        let proxies = self.proxies.clone();
+        let jobs: Vec<_> = targets
+            .into_iter()
+            .enumerate()
+            .map(|(position, (account, proxy_id))| {
+                let proxy = proxy_id
+                    .and_then(|id| proxies.iter().find(|record| record.id == id))
+                    .or_else(|| proxies.get(position % proxies.len().max(1)));
+                let options = SessionOptions {
+                    proxy: proxy.and_then(|record| parse_proxy(&record.url).ok()),
+                    timeout,
+                };
+                (account, options)
+            })
+            .collect();
+        let concurrency = self.concurrency;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let task = self.runtime.spawn(async move {
+            stream::iter(jobs.into_iter().map(move |(account, options)| {
+                let sender = sender.clone();
+                let query = query.clone();
+                async move {
+                    let email = account.email.clone();
+                    if let Ok(hits) = search_account_mail(&account, &options, &query, 5).await {
+                        for hit in hits {
+                            let _ = sender.send((email.clone(), hit));
+                        }
+                    }
+                }
+            }))
+            .buffer_unordered(concurrency.max(1))
+            .for_each(|_| futures::future::ready(()))
+            .await;
+        });
+        self.batch_abort = Some(task.abort_handle());
+        cx.spawn(async move |this, cx| {
+            while let Some((email, hit)) = receiver.recv().await {
+                let _ = this.update(cx, |app, cx| {
+                    app.mail_hits.push((email, hit));
+                    cx.notify();
+                });
+            }
+            let _ = this.update(cx, |app, cx| {
+                app.mail_scanning = false;
+                app.batch_abort = None;
+                app.notice = format!("{} messages matched", app.mail_hits.len());
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn count_status(&self, predicate: impl Fn(&CheckStatus) -> bool) -> usize {
         self.accounts
             .iter()
@@ -588,9 +689,11 @@ impl MailApp {
             .collect()
     }
 
-    fn open_account(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn open_account(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.accounts[index].id;
         self.workspace = Workspace::Mail;
-        self.select_account(index, cx);
+        self.client
+            .update(cx, |client, cx| client.open_saved(id, window, cx));
     }
 
     fn reset_results(&mut self, cx: &mut Context<Self>) {
@@ -610,7 +713,7 @@ impl MailApp {
     }
 
     fn delete_selected_account(&mut self, cx: &mut Context<Self>) {
-        if self.checking || self.busy {
+        if self.checking {
             return;
         }
         let Some(index) = self.selected_account else {
@@ -618,249 +721,19 @@ impl MailApp {
             cx.notify();
             return;
         };
+        self.client
+            .update(cx, |client, cx| client.cancel_operations(cx));
         match self.store.delete_account(self.accounts[index].id) {
             Ok(()) => {
                 self.accounts.remove(index);
                 self.selected_account = None;
-                self.folders.clear();
-                self.selected_folder = None;
-                self.page = MessagePage::default();
-                self.detail = None;
                 self.notice = "Account deleted from local database".into();
+                self.client
+                    .update(cx, |client, cx| client.refresh_accounts(cx));
             }
             Err(error) => self.notice = format!("Delete failed: {error}"),
         }
         cx.notify();
-    }
-
-    fn select_account(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.busy || index >= self.accounts.len() {
-            return;
-        }
-        self.selected_account = Some(index);
-        self.folders.clear();
-        self.selected_folder = None;
-        self.page = MessagePage::default();
-        self.selected_message = None;
-        self.detail = None;
-        self.busy = true;
-        self.notice = "Loading folders with read-only IMAP…".into();
-        cx.notify();
-
-        let account = self.accounts[index].account.clone();
-        let options = self.account_options(index);
-        let runtime = self.runtime.clone();
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { load_folders(&account, &options).await })
-                .await
-                .map_err(|error| Error::Protocol(error.to_string()))
-                .and_then(|result| result);
-            let _ = this.update(cx, |app, cx| {
-                app.busy = false;
-                match result {
-                    Ok(folders) => {
-                        app.notice = format!("{} folders loaded", folders.len());
-                        app.folders = folders.into_iter().map(|folder| folder.name).collect();
-                    }
-                    Err(error) => app.notice = format!("Folder load failed: {error}"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn account_options(&self, index: usize) -> SessionOptions {
-        let proxy = self.accounts[index]
-            .proxy_id
-            .and_then(|id| self.proxies.iter().find(|proxy| proxy.id == id))
-            .and_then(|record| parse_proxy(&record.url).ok());
-        SessionOptions {
-            proxy,
-            timeout: Duration::from_secs(self.settings.timeout_seconds),
-        }
-    }
-
-    fn select_folder(&mut self, folder: String, cx: &mut Context<Self>) {
-        self.selected_folder = Some(folder);
-        self.page = MessagePage::default();
-        self.selected_message = None;
-        self.detail = None;
-        self.load_page(0, cx);
-    }
-
-    fn load_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let Some(account_index) = self.selected_account else {
-            return;
-        };
-        let Some(folder) = self.selected_folder.clone() else {
-            return;
-        };
-        if page > 0 && page.saturating_mul(PAGE_SIZE) >= self.page.total {
-            return;
-        }
-        self.busy = true;
-        self.notice = format!("Loading page {}…", page + 1);
-        self.selected_message = None;
-        self.detail = None;
-        cx.notify();
-
-        let account = self.accounts[account_index].account.clone();
-        let options = self.account_options(account_index);
-        let runtime = self.runtime.clone();
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { load_page(&account, &options, &folder, page).await })
-                .await
-                .map_err(|error| Error::Protocol(error.to_string()))
-                .and_then(|result| result);
-            let _ = this.update(cx, |app, cx| {
-                app.busy = false;
-                match result {
-                    Ok(page) => {
-                        app.notice = format!(
-                            "Page {}/{} · {} messages",
-                            page.page + 1,
-                            page.total.max(1).div_ceil(PAGE_SIZE),
-                            page.total
-                        );
-                        app.page = page;
-                    }
-                    Err(error) => app.notice = format!("Message list failed: {error}"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn open_message(&mut self, uid: u32, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        let Some(account_index) = self.selected_account else {
-            return;
-        };
-        let Some(folder) = self.selected_folder.clone() else {
-            return;
-        };
-        self.busy = true;
-        self.selected_message = Some(uid);
-        self.detail = None;
-        self.notice = format!("Loading UID {uid} with BODY.PEEK[]…");
-        cx.notify();
-
-        let account = self.accounts[account_index].account.clone();
-        let options = self.account_options(account_index);
-        let runtime = self.runtime.clone();
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { load_message(&account, &options, &folder, uid).await })
-                .await
-                .map_err(|error| Error::Protocol(error.to_string()))
-                .and_then(|result| result);
-            let _ = this.update(cx, |app, cx| {
-                app.busy = false;
-                match result {
-                    Ok(message) => {
-                        app.notice = format!("UID {uid} loaded · flags unchanged");
-                        app.detail = Some(message);
-                    }
-                    Err(error) => app.notice = format!("Message load failed: {error}"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn account_row(&self, index: usize) -> gpui::Div {
-        let row = &self.accounts[index];
-        let selected = self.selected_account == Some(index);
-        let (status, color) = status_label(&row.status);
-        let checked = row
-            .last_checked_at
-            .map_or_else(|| "NEVER CHECKED".into(), format_timestamp);
-        let proxy = row
-            .proxy_id
-            .map_or_else(|| "DIRECT".into(), |id| format!("PROXY #{id}"));
-        div()
-            .h(px(92.))
-            .w_full()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(BORDER)
-            .bg(if selected { PURPLE_SOFT } else { PANEL })
-            .hover(|style| style.bg(PANEL_ALT))
-            .child(
-                div()
-                    .w_full()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(TEXT)
-                    .child(row.account.email.clone()),
-            )
-            .child(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(MUTED)
-                    .child(row.account.imap_host()),
-            )
-            .child(
-                div()
-                    .pt_2()
-                    .flex()
-                    .flex_row()
-                    .justify_between()
-                    .child(div().text_xs().text_color(color).child(status))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(MUTED)
-                            .child(format!("{checked} · {proxy}")),
-                    ),
-            )
-    }
-
-    fn message_row(&self, index: usize) -> gpui::Div {
-        let message: &MessageSummary = &self.page.messages[index];
-        let selected = self.selected_message == Some(message.uid);
-        div()
-            .h(px(88.))
-            .w_full()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(BORDER)
-            .bg(if selected { PURPLE_SOFT } else { PANEL })
-            .hover(|style| style.bg(PANEL_ALT))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(TEXT)
-                    .child(message.subject.clone()),
-            )
-            .child(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(MUTED)
-                    .child(message.from.clone()),
-            )
-            .child(
-                div()
-                    .pt_2()
-                    .text_xs()
-                    .text_color(MUTED)
-                    .child(format!("{} · {} bytes", message.date, message.size)),
-            )
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -872,19 +745,19 @@ impl MailApp {
             )
         });
         div()
-            .w(px(232.))
-            .m_3()
+            .w(px(168.))
+            .m_2()
             .mr_0()
             .mb(px(44.))
             .flex()
             .flex_col()
-            .p_3()
+            .p_2()
             .gap_1()
             .rounded_xl()
             .bg(PANEL)
             .child(
                 div()
-                    .h(px(72.))
+                    .h(px(48.))
                     .px_2()
                     .flex()
                     .flex_row()
@@ -914,12 +787,7 @@ impl MailApp {
                         div()
                             .flex()
                             .flex_col()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("Thunder"),
-                            )
+                            .child(div().text_lg().font_weight(FontWeight::BOLD).child("Hakus"))
                             .child(
                                 div()
                                     .text_xs()
@@ -946,7 +814,7 @@ impl MailApp {
             ))
             .child(sidebar_button(
                 "▤",
-                "Mail viewer",
+                "Mail client",
                 self.workspace == Workspace::Mail,
                 Workspace::Mail,
                 cx,
@@ -1083,9 +951,9 @@ impl MailApp {
                         .child(div().flex_1())
                         .child(icon_button("→").on_mouse_down(
                             MouseButton::Left,
-                            move |_, _, cx| {
+                            move |_, window, cx| {
                                 cx.stop_propagation();
-                                open_app.update(cx, |app, cx| app.open_account(index, cx));
+                                open_app.update(cx, |app, cx| app.open_account(index, window, cx));
                             },
                         ))
                 })
@@ -1098,6 +966,12 @@ impl MailApp {
             "Search email or IMAP host…".into()
         } else {
             search
+        };
+        let mail_query_focused = self.mail_query_focus.is_focused(window);
+        let mail_query_display = if self.mail_query.is_empty() {
+            "Search mail content…".to_owned()
+        } else {
+            self.mail_query.clone()
         };
         let progress = if self.run_total == 0 {
             0.
@@ -1118,10 +992,10 @@ impl MailApp {
             .bg(PANEL)
             .child(
                 div()
-                    .h(px(104.))
+                    .h(px(74.))
                     .w_full()
                     .px_6()
-                    .py_5()
+                    .py_3()
                     .flex()
                     .flex_row()
                     .justify_between()
@@ -1132,7 +1006,7 @@ impl MailApp {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_2xl()
+                                    .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Accounts"),
                             )
@@ -1173,7 +1047,7 @@ impl MailApp {
             )
             .child(
                 div()
-                    .h(px(82.))
+                    .h(px(66.))
                     .w_full()
                     .px_6()
                     .pb_3()
@@ -1214,13 +1088,15 @@ impl MailApp {
             )
             .child(
                 div()
-                    .h(px(68.))
+                    .min_h(px(88.))
+                    .flex_shrink_0()
                     .w_full()
                     .px_6()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
                             .id("account-search")
@@ -1252,13 +1128,14 @@ impl MailApp {
                                 let focus = self.search_focus.clone();
                                 move |_, window, _| window.focus(&focus)
                             })
-                            .w(px(340.))
-                            .h(px(42.))
+                            .w(px(230.))
+                            .h(px(32.))
                             .px_4()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
-                            .gap_3()
+                            .gap_2()
                             .rounded_lg()
                             .bg(PANEL_ALT)
                             .border_1()
@@ -1274,10 +1151,11 @@ impl MailApp {
                     )
                     .child(
                         div()
-                            .h(px(42.))
+                            .h(px(32.))
                             .px_1()
                             .flex()
                             .flex_row()
+                            .flex_wrap()
                             .items_center()
                             .gap_1()
                             .rounded_full()
@@ -1306,6 +1184,77 @@ impl MailApp {
                                 self.account_filter,
                                 cx,
                             )),
+                    )
+                    .child(
+                        div()
+                            .id("mail-content-search")
+                            .track_focus(&self.mail_query_focus)
+                            .on_key_down(cx.listener(|app, event: &KeyDownEvent, _, cx| {
+                                let key = event.keystroke.key.as_str();
+                                if key == "enter" {
+                                    app.search_mail(cx);
+                                } else if key == "v" && event.keystroke.modifiers.secondary() {
+                                    if let Some(text) =
+                                        cx.read_from_clipboard().and_then(|item| item.text())
+                                    {
+                                        app.mail_query = text.trim().replace(['\r', '\n'], " ");
+                                    }
+                                } else if key == "backspace" {
+                                    app.mail_query.pop();
+                                } else if key == "escape" {
+                                    app.mail_query.clear();
+                                } else if !event.keystroke.modifiers.control
+                                    && !event.keystroke.modifiers.platform
+                                {
+                                    if let Some(character) = &event.keystroke.key_char {
+                                        app.mail_query.push_str(character);
+                                    }
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .on_mouse_down(MouseButton::Left, {
+                                let focus = self.mail_query_focus.clone();
+                                move |_, window, _| window.focus(&focus)
+                            })
+                            .w(px(220.))
+                            .h(px(32.))
+                            .px_4()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .rounded_lg()
+                            .bg(PANEL_ALT)
+                            .border_1()
+                            .border_color(if mail_query_focused {
+                                PURPLE
+                            } else {
+                                PANEL_ALT
+                            })
+                            .text_sm()
+                            .text_color(if mail_query_display.starts_with("Search mail") {
+                                MUTED
+                            } else {
+                                TEXT
+                            })
+                            .child(div().text_color(MUTED).child("✉"))
+                            .child(mail_query_display),
+                    )
+                    .child(
+                        action_button(
+                            if self.mail_scanning {
+                                "Searching…"
+                            } else {
+                                "Search mail"
+                            },
+                            false,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|app, _, _, cx| app.search_mail(cx)),
+                        ),
                     ),
             )
             .child(
@@ -1400,6 +1349,49 @@ impl MailApp {
             } else {
                 list.into_any_element()
             })
+            .children((!self.mail_hits.is_empty() || self.mail_scanning).then(|| {
+                let hits: Vec<_> = self
+                    .mail_hits
+                    .iter()
+                    .take(40)
+                    .map(|(email, hit)| {
+                        div()
+                            .px_6()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .border_t_1()
+                            .border_color(BORDER)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(hit.subject.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(MUTED)
+                                    .child(format!("{email} · {} · {}", hit.folder, hit.from)),
+                            )
+                    })
+                    .collect();
+                div()
+                    .id("mail-search-results")
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(div().px_6().py_2().text_xs().text_color(MUTED).child(
+                        if self.mail_scanning {
+                            "Searching mail…".to_owned()
+                        } else {
+                            format!("{} matching messages", self.mail_hits.len())
+                        },
+                    ))
+                    .children(hits)
+            }))
             .child(
                 div()
                     .h(px(66.))
@@ -1442,185 +1434,6 @@ impl MailApp {
                         MouseButton::Left,
                         cx.listener(|app, _, _, cx| app.delete_selected_account(cx)),
                     )),
-            )
-    }
-
-    fn render_mail(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        let app = cx.entity().clone();
-        let accounts_list = uniform_list("accounts", self.accounts.len(), {
-            let app = app.clone();
-            move |range, _window, cx| {
-                range
-                    .map(|index| {
-                        let row = app.read(cx).account_row(index);
-                        let app = app.clone();
-                        row.cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                app.update(cx, |app, cx| app.select_account(index, cx));
-                            })
-                    })
-                    .collect()
-            }
-        })
-        .h_full();
-
-        let folders_list = uniform_list("folders", self.folders.len(), {
-            let app = app.clone();
-            move |range, _window, cx| {
-                range
-                    .map(|index| {
-                        let this = app.read(cx);
-                        let folder = this.folders[index].clone();
-                        let selected = this.selected_folder.as_ref() == Some(&folder);
-                        let row = div()
-                            .h(px(44.))
-                            .w_full()
-                            .px_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(BORDER)
-                            .bg(if selected { PURPLE_SOFT } else { PANEL })
-                            .hover(|style| style.bg(PANEL_ALT))
-                            .text_sm()
-                            .text_color(TEXT)
-                            .child(folder.clone());
-                        let app = app.clone();
-                        row.cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                app.update(cx, |app, cx| app.select_folder(folder.clone(), cx));
-                            })
-                    })
-                    .collect()
-            }
-        })
-        .h_full();
-
-        let messages_list = uniform_list("messages", self.page.messages.len(), {
-            let app = app.clone();
-            move |range, _window, cx| {
-                range
-                    .map(|index| {
-                        let row = app.read(cx).message_row(index);
-                        let uid = app.read(cx).page.messages[index].uid;
-                        let app = app.clone();
-                        row.cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                app.update(cx, |app, cx| app.open_message(uid, cx));
-                            })
-                    })
-                    .collect()
-            }
-        })
-        .h_full();
-
-        let detail = self.detail.as_ref().map_or_else(
-            || {
-                empty_state(
-                    "SELECT A MESSAGE",
-                    "Bodies load lazily with BODY.PEEK[] · HTML is never executed",
-                )
-            },
-            |message| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(TEXT)
-                            .child(message.subject.clone()),
-                    )
-                    .child(meta_line("FROM", &message.from))
-                    .child(meta_line("TO", &message.to))
-                    .child(meta_line("DATE", &message.date))
-                    .child(
-                        div()
-                            .pt_4()
-                            .border_t_1()
-                            .border_color(BORDER)
-                            .text_sm()
-                            .text_color(TEXT)
-                            .child(message.body.clone()),
-                    )
-            },
-        );
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .mt_3()
-            .mr_3()
-            .mb_2()
-            .flex()
-            .flex_row()
-            .rounded_xl()
-            .overflow_hidden()
-            .bg(PANEL)
-            .child(panel("Accounts", accounts_list, 320.))
-            .child(panel("Folders", folders_list, 180.))
-            .child(
-                div()
-                    .w(px(380.))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .border_r_1()
-                    .border_color(BORDER)
-                    .child(panel_header(format!(
-                        "MESSAGES · PAGE {}",
-                        self.page.page + 1
-                    )))
-                    .child(div().flex_1().min_h_0().child(messages_list))
-                    .child(
-                        div()
-                            .h(px(48.))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .px_4()
-                            .border_t_1()
-                            .border_color(BORDER)
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(BLUE)
-                                    .child("← PREVIOUS")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|app, _, _, cx| {
-                                            app.load_page(app.page.page.saturating_sub(1), cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(BLUE)
-                                    .child("Next →")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|app, _, _, cx| {
-                                            app.load_page(app.page.page + 1, cx);
-                                        }),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("message-detail")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .p_6()
-                    .child(detail),
             )
     }
 
@@ -2099,7 +1912,7 @@ impl MailApp {
                             .child("Cleanup"),
                     )
                     .child(div().text_sm().text_color(MUTED).child(
-                        "Destructive actions are blocked while checks or mail loading are active.",
+                        "Cleanup stops active mail requests. Stop batch checks before deleting data.",
                     ))
                     .child(
                         div()
@@ -2135,15 +1948,19 @@ impl Render for MailApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = match self.workspace {
             Workspace::Accounts => self.render_accounts(window, cx).into_any_element(),
-            Workspace::Mail => self.render_mail(cx).into_any_element(),
+            Workspace::Mail => self.client.clone().into_any_element(),
             Workspace::History => self.render_history(cx).into_any_element(),
             Workspace::Proxies => self.render_proxies(cx).into_any_element(),
             Workspace::Settings => self.render_settings(cx).into_any_element(),
         };
-        div()
+        let is_client = self.workspace == Workspace::Mail;
+        let workspace = div()
             .size_full()
             .on_key_down(cx.listener(|app, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "v" && event.keystroke.modifiers.secondary() {
+                if app.workspace != Workspace::Mail
+                    && event.keystroke.key == "v"
+                    && event.keystroke.modifiers.secondary()
+                {
                     app.paste_from_clipboard(cx);
                     cx.stop_propagation();
                 }
@@ -2153,7 +1970,7 @@ impl Render for MailApp {
             .font_family("Onest")
             .bg(BG)
             .text_color(TEXT)
-            .child(self.render_sidebar(cx))
+            .when(!is_client, |view| view.child(self.render_sidebar(cx)))
             .child(
                 div()
                     .flex_1()
@@ -2162,26 +1979,79 @@ impl Render for MailApp {
                     .flex()
                     .flex_col()
                     .child(content)
+                    .when(!is_client, |view| {
+                        view.child(
+                            div()
+                                .h(px(34.))
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px_4()
+                                .border_t_1()
+                                .border_color(BORDER)
+                                .child(div().text_xs().text_color(MUTED).child(self.notice.clone()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(MUTED)
+                                        .child("Read-only IMAP · Local workspace"),
+                                ),
+                        )
+                    }),
+            );
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(BG)
+            .text_color(TEXT)
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(BORDER)
                     .child(
                         div()
-                            .h(px(34.))
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .px_4()
-                            .border_t_1()
-                            .border_color(BORDER)
-                            .child(div().text_xs().text_color(MUTED).child(self.notice.clone()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(MUTED)
-                                    .child("Read-only IMAP · Local workspace"),
-                            ),
-                    ),
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("HAKUS"),
+                    )
+                    .child(
+                        Button::new("mode-client")
+                            .label("Mail client")
+                            .ghost()
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.workspace = Workspace::Mail;
+                                app.client
+                                    .update(cx, |client, cx| client.refresh_accounts(cx));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("mode-checker")
+                            .label("Account checker")
+                            .ghost()
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.client.read(cx).hide_webviews(cx);
+                                app.workspace = Workspace::Accounts;
+                                app.reload_data();
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(div().text_xs().text_color(MUTED).child(if is_client {
+                        "Read-only mail workspace"
+                    } else {
+                        "Batch checks and workspace tools"
+                    })),
             )
+            .child(div().flex_1().min_h_0().child(workspace))
     }
 }
 
@@ -2223,6 +2093,10 @@ fn sidebar_button(
             MouseButton::Left,
             cx.listener(move |app, _, _, cx| {
                 app.workspace = workspace;
+                if workspace == Workspace::Mail {
+                    app.client
+                        .update(cx, |client, cx| client.refresh_accounts(cx));
+                }
                 if workspace == Workspace::History {
                     if let Ok(runs) = app.store.runs(100) {
                         app.runs = runs;
@@ -2435,18 +2309,6 @@ fn panel_header(title: impl Into<SharedString>) -> gpui::Div {
         .child(title.into())
 }
 
-fn panel(title: &'static str, list: gpui::UniformList, width: f32) -> gpui::Div {
-    div()
-        .w(px(width))
-        .h_full()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(BORDER)
-        .child(panel_header(title))
-        .child(div().flex_1().min_h_0().child(list))
-}
-
 fn empty_state(title: &'static str, subtitle: &'static str) -> gpui::Div {
     div()
         .flex_1()
@@ -2462,15 +2324,6 @@ fn empty_state(title: &'static str, subtitle: &'static str) -> gpui::Div {
                 .child(title),
         )
         .child(div().text_sm().text_color(MUTED).child(subtitle))
-}
-
-fn meta_line(label: &'static str, value: &str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_row()
-        .gap_3()
-        .child(div().w(px(48.)).text_xs().text_color(MUTED).child(label))
-        .child(div().text_sm().text_color(TEXT).child(value.to_owned()))
 }
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -2527,31 +2380,56 @@ fn run(args: Args) -> Result<()> {
     let runtime = Arc::new(Runtime::new().context("start Tokio runtime")?);
     let concurrency = args.concurrency.clamp(1, 64);
     Application::new().run(move |cx| {
+        gpui_component::init(cx);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+        ]);
+        cx.set_menus(vec![Menu {
+            name: "Hakus".into(),
+            items: vec![MenuItem::action("Quit Hakus", Quit)],
+        }]);
+        Theme::change(ThemeMode::Dark, None, cx);
+        let theme = Theme::global_mut(cx);
+        theme.colors.primary = rgb(0x75b9ff).into();
+        theme.colors.primary_foreground = rgb(0x111722).into();
+        theme.font_family = "Onest".into();
         cx.text_system()
             .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
                 "../assets/Onest.ttf"
             ))])
             .expect("load Onest font");
-        let bounds = Bounds::centered(None, size(px(1680.), px(980.)), cx);
+        let bounds = Bounds::centered(None, size(px(980.), px(680.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(800.), px(560.))),
                 ..WindowOptions::default()
             },
             {
                 let store = store.clone();
                 let runtime = runtime.clone();
                 let database_path = database_path.clone();
-                move |_, cx| {
-                    cx.new(|cx| {
+                let message_path = args.message.clone();
+                move |window, cx| {
+                    let app = cx.new(|cx| {
                         MailApp::new(
                             runtime.clone(),
                             store.clone(),
                             database_path.clone(),
                             concurrency,
+                            window,
                             cx,
                         )
-                    })
+                    });
+                    if let Some(path) = &message_path {
+                        app.update(cx, |app, cx| {
+                            app.client
+                                .update(cx, |client, cx| client.open_message_file(path, cx))
+                        });
+                    }
+                    cx.new(|cx| Root::new(app, window, cx))
                 }
             },
         )

@@ -135,6 +135,9 @@ impl Store {
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  email TEXT NOT NULL COLLATE NOCASE UNIQUE,
                  password TEXT NOT NULL,
+                 host TEXT,
+                 port INTEGER NOT NULL DEFAULT 993,
+                 starttls INTEGER NOT NULL DEFAULT 0,
                  status TEXT NOT NULL DEFAULT 'idle',
                  messages INTEGER,
                  last_error TEXT,
@@ -167,6 +170,20 @@ impl Store {
              CREATE INDEX IF NOT EXISTS run_accounts_account
                  ON run_accounts(account_id, checked_at DESC);",
         )?;
+        let account_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(accounts)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (name, definition) in [
+            ("host", "host TEXT"),
+            ("port", "port INTEGER NOT NULL DEFAULT 993"),
+            ("starttls", "starttls INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !account_columns.iter().any(|column| column == name) {
+                connection.execute(&format!("ALTER TABLE accounts ADD COLUMN {definition}"), [])?;
+            }
+        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS workspace_settings (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -277,6 +294,71 @@ impl Store {
         Ok(summary)
     }
 
+    /// Saves one account for direct IMAP access, resetting stale check results.
+    pub fn save_account(&self, account: &Account) -> rusqlite::Result<i64> {
+        self.save_connection(account, None)
+    }
+
+    /// Atomically saves one account and its optional proxy connection.
+    pub fn save_connection(
+        &self,
+        account: &Account,
+        proxy_url: Option<&str>,
+    ) -> rusqlite::Result<i64> {
+        let proxy_url = proxy_url
+            .map(|url| normalize_proxy(url).ok_or(rusqlite::Error::InvalidQuery))
+            .transpose()?;
+        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        self.ensure_idle()?;
+        let transaction = connection.transaction()?;
+        let now = unix_time();
+        let proxy_id = proxy_url
+            .map(|url| {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO proxies (url, created_at) VALUES (?1, ?2)",
+                    params![url, now],
+                )?;
+                transaction.query_row(
+                    "SELECT id FROM proxies WHERE url = ?1",
+                    params![url],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .transpose()?;
+        transaction.execute(
+            "INSERT INTO accounts
+             (email, password, host, port, starttls, proxy_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(email) DO UPDATE SET
+                 password = excluded.password,
+                 host = excluded.host,
+                 port = excluded.port,
+                 starttls = excluded.starttls,
+                 status = 'idle',
+                 messages = NULL,
+                 last_error = NULL,
+                 last_checked_at = NULL,
+                 proxy_id = excluded.proxy_id,
+                 updated_at = excluded.updated_at",
+            params![
+                account.email,
+                account.password,
+                account.host,
+                account.port,
+                account.starttls,
+                proxy_id,
+                now
+            ],
+        )?;
+        let id = transaction.query_row(
+            "SELECT id FROM accounts WHERE email = ?1 COLLATE NOCASE",
+            params![account.email],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
     /// Imports and validates one proxy URL or `host:port:user:password` row per line.
     pub fn import_proxies(&self, input: &str) -> rusqlite::Result<ImportSummary> {
         let mut summary = ImportSummary::default();
@@ -309,24 +391,27 @@ impl Store {
     pub fn accounts(&self) -> rusqlite::Result<Vec<StoredAccount>> {
         let connection = self.connection.lock().expect("store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id, email, password, status, messages, last_error,
+            "SELECT id, email, password, host, port, starttls, status, messages, last_error,
                     last_checked_at, proxy_id FROM accounts ORDER BY id",
         )?;
         let rows = statement.query_map([], |row| {
             let status = decode_status(
-                &row.get::<_, String>(3)?,
-                row.get::<_, Option<u32>>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                &row.get::<_, String>(6)?,
+                row.get::<_, Option<u32>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             );
             Ok(StoredAccount {
                 id: row.get(0)?,
                 account: Account {
                     email: row.get(1)?,
                     password: row.get(2)?,
+                    host: row.get(3)?,
+                    port: row.get(4)?,
+                    starttls: row.get(5)?,
                 },
                 status,
-                last_checked_at: row.get(6)?,
-                proxy_id: row.get(7)?,
+                last_checked_at: row.get(9)?,
+                proxy_id: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -556,6 +641,117 @@ fn unix_time() -> i64 {
 mod tests {
     use super::*;
 
+    fn temporary_database() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fuckthunder-gui-{}-{}.sqlite",
+            std::process::id(),
+            generate_api_token()
+        ))
+    }
+
+    fn remove_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn manual_starttls_endpoint_survives_reopening_the_database() {
+        let path = temporary_database();
+        let account = Account::new(
+            "person@example.com",
+            "secret",
+            Some("mail.example.com"),
+            1143,
+            true,
+        )
+        .unwrap();
+        let id = Store::open(&path).unwrap().save_account(&account).unwrap();
+
+        let store = Store::open(&path).unwrap();
+        let stored = store.accounts().unwrap().remove(0);
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.account.imap_host(), "mail.example.com");
+        assert_eq!(stored.account.imap_port(), 1143);
+        assert!(stored.account.uses_starttls());
+        assert_eq!(stored.account.password, "secret");
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn case_insensitive_update_preserves_identity_and_history() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .import_accounts("person@example.com:old-secret")
+            .unwrap();
+        let original = store.accounts().unwrap().remove(0);
+        let run = store.begin_run().unwrap();
+        store
+            .record_check(run, original.id, None, &CheckStatus::Valid { messages: 7 })
+            .unwrap();
+        store.finish_run(run).unwrap();
+        let replacement = Account::new(
+            "PERSON@example.com",
+            "new-secret",
+            Some("imap.example.com"),
+            1993,
+            false,
+        )
+        .unwrap();
+
+        let id = store
+            .save_connection(&replacement, Some("http://proxy.example:8080"))
+            .unwrap();
+
+        assert_eq!(id, original.id);
+        let stored = store.accounts().unwrap().remove(0);
+        assert_eq!(stored.account.password, "new-secret");
+        assert_eq!(stored.account.imap_host(), "imap.example.com");
+        assert_eq!(stored.account.imap_port(), 1993);
+        assert_eq!(stored.status, CheckStatus::Idle);
+        assert_eq!(stored.last_checked_at, None);
+        assert!(stored.proxy_id.is_some());
+        let runs = store.runs(1).unwrap();
+        assert_eq!(runs[0].valid, 1);
+        assert_eq!(runs[0].total, 1);
+    }
+
+    #[test]
+    fn legacy_accounts_gain_default_connection_settings() {
+        let path = temporary_database();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                     password TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'idle',
+                     messages INTEGER,
+                     last_error TEXT,
+                     last_checked_at INTEGER,
+                     proxy_id INTEGER,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO accounts (email, password, created_at, updated_at)
+                 VALUES ('legacy@example.com', 'secret', 1, 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path).unwrap();
+        let stored = store.accounts().unwrap().remove(0);
+        assert_eq!(stored.account.email, "legacy@example.com");
+        assert_eq!(stored.account.password, "secret");
+        assert_eq!(stored.account.imap_host(), "imap.example.com");
+        assert_eq!(stored.account.imap_port(), 993);
+        assert!(!stored.account.uses_starttls());
+        drop(store);
+        remove_database(&path);
+    }
+
     #[test]
     fn persists_accounts_proxies_and_run_history() {
         let store = Store::open_in_memory().unwrap();
@@ -630,6 +826,7 @@ mod tests {
         let account = store.accounts().unwrap().remove(0);
         let proxy = store.proxies().unwrap().remove(0);
         let run = store.begin_run().unwrap();
+        assert!(store.save_account(&account.account).is_err());
         store
             .record_check(run, account.id, Some(proxy.id), &CheckStatus::Idle)
             .unwrap();
