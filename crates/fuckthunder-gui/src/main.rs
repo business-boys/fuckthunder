@@ -41,20 +41,20 @@ const fn rgba(hex: u32) -> gpui::Rgba {
     }
 }
 
-const BG: gpui::Rgba = rgba(0x0a0a0a);
-const PANEL: gpui::Rgba = rgba(0x141416);
-const PANEL_ALT: gpui::Rgba = rgba(0x1c1c20);
-const BORDER: gpui::Rgba = rgba(0x29292e);
-const TEXT: gpui::Rgba = rgba(0xf2f2f5);
-const MUTED: gpui::Rgba = rgba(0x9a9aa2);
-const GREEN: gpui::Rgba = rgba(0x62d9a5);
+const BG: gpui::Rgba = rgba(0x17191d);
+const PANEL: gpui::Rgba = rgba(0x1d2025);
+const PANEL_ALT: gpui::Rgba = rgba(0x242830);
+const BORDER: gpui::Rgba = rgba(0x30343b);
+const TEXT: gpui::Rgba = rgba(0xe7e9ee);
+const MUTED: gpui::Rgba = rgba(0x9ca4b1);
+const GREEN: gpui::Rgba = rgba(0x78c99c);
 const RED: gpui::Rgba = rgba(0xff5f56);
 const AMBER: gpui::Rgba = rgba(0xf2bc68);
-const BLUE: gpui::Rgba = rgba(0x9b72ff);
-const PURPLE: gpui::Rgba = rgba(0x8135ff);
-const PURPLE_HOVER: gpui::Rgba = rgba(0x9153ff);
-const PURPLE_SOFT: gpui::Rgba = rgba(0x251a3d);
-const ROW_HOVER: gpui::Rgba = rgba(0x202024);
+const BLUE: gpui::Rgba = rgba(0x75b9ff);
+const PURPLE: gpui::Rgba = rgba(0x75b9ff);
+const PURPLE_HOVER: gpui::Rgba = rgba(0x92c8ff);
+const PURPLE_SOFT: gpui::Rgba = rgba(0x25364b);
+const ROW_HOVER: gpui::Rgba = rgba(0x242a33);
 const ACCOUNT_PAGE_SIZE: usize = 25;
 
 #[derive(Debug, Parser)]
@@ -1700,7 +1700,7 @@ impl MailApp {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_2xl()
+                                    .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("Settings & local API"),
                             )
@@ -2073,7 +2073,7 @@ fn sidebar_button(
         .rounded_lg()
         .cursor_pointer()
         .bg(if selected { PURPLE_SOFT } else { PANEL })
-        .hover(|style| style.bg(if selected { rgba(0x30204d) } else { PANEL_ALT }))
+        .hover(|style| style.bg(if selected { rgba(0x2b3e55) } else { PANEL_ALT }))
         .text_sm()
         .font_weight(if selected {
             FontWeight::SEMIBOLD
@@ -2270,7 +2270,7 @@ fn compact_button(label: impl Into<SharedString>, selected: bool) -> gpui::Div {
         .rounded_full()
         .cursor_pointer()
         .bg(if selected { PURPLE_SOFT } else { PANEL })
-        .hover(|style| style.bg(if selected { rgba(0x30204d) } else { PANEL_ALT }))
+        .hover(|style| style.bg(if selected { rgba(0x2b3e55) } else { PANEL_ALT }))
         .text_sm()
         .font_weight(if selected {
             FontWeight::SEMIBOLD

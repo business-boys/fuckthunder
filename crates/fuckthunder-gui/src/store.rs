@@ -599,7 +599,10 @@ fn normalize_proxy(row: &str) -> Option<String> {
         if host.is_empty() || port.parse::<u16>().is_err() {
             return None;
         }
-        format!("http://{user}:{password}@{host}:{port}")
+        let mut url = url::Url::parse(&format!("http://{host}:{port}")).ok()?;
+        url.set_username(user).ok()?;
+        url.set_password(Some(password)).ok()?;
+        url.to_string()
     };
     parse_proxy(&url).ok().map(|_| url)
 }
@@ -653,6 +656,64 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // Escaped credentials must reach proxy authentication as their original bytes.
+    #[test]
+    fn decodes_proxy_url_credentials_for_both_protocols() {
+        for scheme in ["http", "socks5", "residential"] {
+            let proxy = parse_proxy(&format!(
+                "{scheme}://user%40name:pass%3Aword%23@proxy.example:1234"
+            ))
+            .unwrap();
+            assert_eq!(proxy.auth, Some(("user@name".into(), "pass:word#".into())));
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_http_and_socks_routes_as_distinct_proxies() {
+        let store = Store::open_in_memory().unwrap();
+        let summary = store
+            .import_proxies(
+                "http://user:pass@proxy.example:1234\nsocks5://user:pass@proxy.example:1234",
+            )
+            .unwrap();
+        assert_eq!(summary.imported, 2);
+        let proxies = store.proxies().unwrap();
+        assert_ne!(
+            parse_proxy(&proxies[0].url).unwrap().protocol,
+            parse_proxy(&proxies[1].url).unwrap().protocol
+        );
+    }
+
+    #[test]
+    fn imports_legacy_proxy_password_with_url_delimiters() {
+        let store = Store::open_in_memory().unwrap();
+        let summary = store
+            .import_proxies("proxy.example:8080:user:pa:ss#word@tail")
+            .unwrap();
+        assert_eq!(summary.imported, 1);
+        let proxies = store.proxies().unwrap();
+        assert_eq!(
+            parse_proxy(&proxies[0].url).unwrap().auth,
+            Some(("user".into(), "pa:ss#word@tail".into()))
+        );
+    }
+
+    // This provider exports SOCKS5 gateways under the residential scheme.
+    #[test]
+    fn imports_residential_gateway_with_authentication_intact() {
+        let store = Store::open_in_memory().unwrap();
+        let summary = store
+            .import_proxies("residential://user:password@proxy.example:12345")
+            .unwrap();
+        assert_eq!(summary.imported, 1);
+        let proxies = store.proxies().unwrap();
+        let proxy = parse_proxy(&proxies[0].url).unwrap();
+        assert_eq!(proxy.host, "proxy.example");
+        assert_eq!(proxy.port, 12345);
+        assert_eq!(proxy.protocol, fuckthunder_imap::ProxyProtocol::Socks5);
+        assert_eq!(proxy.auth, Some(("user".into(), "password".into())));
     }
 
     #[test]

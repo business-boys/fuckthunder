@@ -195,6 +195,15 @@ impl Mailbox {
         self.selected_uid = Some(uid);
     }
 
+    pub(super) fn cancel_operation(&mut self, cx: &mut Context<Self>) {
+        self.cancel(cx);
+    }
+
+    pub(super) fn report_window_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = Some(format!("Cannot open mailbox window: {error}"));
+        cx.notify();
+    }
+
     pub(super) fn hide_webview(&self, cx: &gpui::App) {
         self.viewer.read(cx).hide_webview();
     }

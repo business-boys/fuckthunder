@@ -106,6 +106,37 @@ impl Client {
         cx.notify();
     }
 
+    fn open_mailbox_window(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let account = tab.view.read(cx).account_id();
+        let runtime = self.runtime.clone();
+        let store = self.store.clone();
+        let bounds = gpui::Bounds::centered(None, gpui::size(px(980.), px(680.)), cx);
+        if let Err(error) = cx.open_window(
+            gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
+                window_min_size: Some(gpui::size(px(800.), px(560.))),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let client = cx.new(|cx| {
+                    let mut client = Self::new(runtime, store, window, cx);
+                    if let Some(account) = account {
+                        client.open_saved(account, window, cx);
+                    }
+                    client
+                });
+                cx.new(|cx| gpui_component::Root::new(client, window, cx))
+            },
+        ) {
+            tab.view.update(cx, |mailbox, cx| {
+                mailbox.report_window_error(error.to_string(), cx)
+            });
+        }
+    }
+
     fn close_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
@@ -142,7 +173,7 @@ impl Client {
     pub(super) fn cancel_operations(&mut self, cx: &mut Context<Self>) {
         for tab in &self.tabs {
             tab.view
-                .update(cx, |mailbox, cx| mailbox.refresh_accounts(cx));
+                .update(cx, |mailbox, cx| mailbox.cancel_operation(cx));
         }
     }
 
@@ -186,14 +217,31 @@ impl Render for Client {
                 Tab::new()
                     .label(format!("{prefix}{}", compact_email(&mailbox.title(cx))))
                     .suffix(
-                        Button::new(("close-mailbox", id))
-                            .label("×")
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(id, window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new(("window-mailbox", id))
+                                    .label("↗")
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip("Open mailbox in a separate window")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_mailbox_window(id, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new(("close-mailbox", id))
+                                    .label("×")
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_tab(id, window, cx);
+                                    })),
+                            ),
                     )
                     .min_w(px(140.))
                     .max_w(px(220.))
@@ -229,6 +277,17 @@ impl Render for Client {
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.choose_message(cx)),
                                     ),
+                            )
+                            .child(
+                                Button::new("active-mailbox-window")
+                                    .label("New window")
+                                    .small()
+                                    .ghost()
+                                    .tooltip("Open the current mailbox in another window")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let id = this.tabs[this.active].id;
+                                        this.open_mailbox_window(id, cx);
+                                    })),
                             )
                             .child(
                                 Button::new("new-mailbox-tab")
@@ -282,6 +341,35 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use gpui_component::{Root, Theme, ThemeMode};
+
+    // Opening another mailbox window must not move or close the original tab.
+    #[gpui::test]
+    fn opens_independent_mailbox_window_without_removing_original(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            Theme::change(ThemeMode::Dark, None, cx);
+        });
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut client = None;
+        let window = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| Client::new(runtime, store, window, cx));
+            client = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let client = client.unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.update(|_, cx| {
+            let before = cx.windows().len();
+            client.update(cx, |client, cx| {
+                let id = client.tabs[0].id;
+                client.open_mailbox_window(id, cx);
+                assert_eq!(client.tabs.len(), 1);
+                assert_eq!(client.active, 0);
+            });
+            assert_eq!(cx.windows().len(), before + 1);
+        });
+    }
 
     #[gpui::test]
     fn keeps_twenty_open_mailboxes_independent_when_switching_and_closing(cx: &mut TestAppContext) {

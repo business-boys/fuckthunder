@@ -211,7 +211,8 @@ SOCKS5/HTTP CONNECT proxy. Successful connections are saved in the local SQLite
 workspace, including the password. **+ Add mailbox** opens an independent tab.
 Keep several mailboxes open and switch tabs without resetting their folder,
 page, or open message. The tab strip scrolls and includes an overflow menu.
-Close a tab with **×**. Closing the last tab opens a fresh connection form.
+Use **↗** on a mailbox tab to open it in an independent window.
+The new window has its own IMAP session. The original tab remains open. Close a tab with **×**. Closing the last tab opens a fresh connection form.
 Saved mailboxes appear below the tab strip and reopen without duplicate tabs.
 **Refresh** reloads the current folder, **Disconnect** returns to the connection
 form, and **Cancel** stops an active request in that tab.
@@ -235,8 +236,11 @@ The checker imports UTF-8 `email:password` files through a native file picker
 (CRLF accepted, passwords may contain colons, files up to 16 MiB). Paste account
 rows with **Ctrl+V** on Linux/Windows or **Cmd+V** on macOS. In **Proxy routes**,
 the shortcut imports proxies. In client text fields, it pastes text normally.
-The proxy importer accepts `socks5://`/`http://` URLs and
-`host:port:user:password` rows. Accounts are checked with bounded, adjustable
+The proxy importer accepts `socks5://`/`http://` URLs, provider-exported
+`residential://` URLs (SOCKS5), and
+`host:port:user:password` rows. Explicit `http://` keeps HTTP CONNECT.
+Proxy URL credentials are percent-decoded before authentication. A rejected
+proxy never falls back to a direct connection. Accounts are checked with bounded, adjustable
 concurrency and round-robin proxy assignment; batches can be stopped, failed
 accounts retried and verdicts reset.
 The account workspace includes keyboard search, status/route filters, 25-row
@@ -275,7 +279,9 @@ All mailbox selection uses `EXAMINE`, and full messages use
 The message viewer uses a native WebView for HTML/CSS, selectable wrapped text
 and message source. Its header stays outside the body. Text, HTML, source, full headers, `.eml`
 export, attachment save/open, and detached viewing share one viewer component.
-Mailbox panels have draggable dividers. CID images use decoded MIME resources.
+Mailbox panels have draggable dividers. HTML opens in Fit mode and scales wide
+mail layouts to the reader width. Use Fit, −, + or the percentage reset to change
+zoom. Detached messages keep their current mode and zoom. CID images use decoded MIME resources.
 External images stay blocked until explicitly enabled. Scripts and forms remain
 blocked. Links open in the system browser. Open a local message with
 `fuckthunder-gui --message message.eml`.

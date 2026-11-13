@@ -2416,6 +2416,7 @@ dependencies = [
  "html2text",
  "http-body-util",
  "mailparse",
+ "percent-encoding",
  "rand 0.8.8",
  "rusqlite",
  "serde",

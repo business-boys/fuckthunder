@@ -177,7 +177,7 @@ pub fn parse_proxy(value: &str) -> std::result::Result<ProxyConfig, url::ParseEr
     let url = url::Url::parse(value)?;
     let host = url.host_str().unwrap_or_default().to_owned();
     let protocol = match url.scheme() {
-        "socks5" => ProxyProtocol::Socks5,
+        "socks5" | "residential" => ProxyProtocol::Socks5,
         "http" => ProxyProtocol::HttpConnect,
         _ => return Err(url::ParseError::RelativeUrlWithoutBase),
     };
@@ -185,12 +185,20 @@ pub fn parse_proxy(value: &str) -> std::result::Result<ProxyConfig, url::ParseEr
         ProxyProtocol::Socks5 => 1080,
         ProxyProtocol::HttpConnect => 8080,
     });
-    let auth = (!url.username().is_empty()).then(|| {
-        (
-            url.username().to_owned(),
-            url.password().unwrap_or_default().to_owned(),
-        )
-    });
+    let auth = if url.username().is_empty() {
+        None
+    } else {
+        let decode = |value: &str| {
+            percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map(|value| value.into_owned())
+                .map_err(|_| url::ParseError::InvalidDomainCharacter)
+        };
+        Some((
+            decode(url.username())?,
+            decode(url.password().unwrap_or_default())?,
+        ))
+    };
     Ok(ProxyConfig {
         host,
         port,
@@ -343,10 +351,12 @@ impl MessageView {
                 .replace('<', "&lt;")
                 .replace('>', "&gt;")
         };
-        let mut html = self
-            .html
-            .clone()
-            .unwrap_or_else(|| format!("<pre>{}</pre>", escape(&self.body)));
+        let mut html = self.html.clone().unwrap_or_else(|| {
+            format!(
+                "<pre style=\"white-space:pre-wrap;overflow-wrap:anywhere\">{}</pre>",
+                escape(&self.body)
+            )
+        });
         for file in &self.attachments {
             if let Some(cid) = &file.content_id {
                 if file.media_type.starts_with("image/") {
@@ -363,7 +373,8 @@ impl MessageView {
         } else {
             "data:"
         };
-        format!("<!DOCTYPE html><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {images}; style-src 'unsafe-inline'; script-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'\"><style>body{{margin:0;padding:20px;font:15px/1.6 -apple-system,sans-serif;color:#222;background:#fff;overflow-wrap:anywhere}}img{{max-width:100%;height:auto}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}table{{max-width:100%}}</style>{html}")
+        // Keep author CSS and fixed-width tables intact. The native reader owns width fitting.
+        format!("<!DOCTYPE html><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src {images}; style-src 'unsafe-inline'; script-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'\"><style>:where(body){{font:15px/1.6 -apple-system,sans-serif;color:#222;background:#fff}}</style>{html}")
     }
 }
 

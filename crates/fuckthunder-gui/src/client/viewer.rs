@@ -9,6 +9,71 @@ use tokio::runtime::Runtime;
 const BG: u32 = 0x17191d;
 const BORDER: u32 = 0x30343b;
 const MUTED: u32 = 0x9ca4b1;
+
+// WKWebView permits native evaluation while allowsContentJavaScript stays false.
+// Only the body scale changes. Author widths, tables, and the DOM remain intact.
+const WIDTH_FIT_SCRIPT: &str = r#"
+(() => {
+    let enabled = true;
+    let root;
+    let body;
+    let originalZoom;
+    let originalPriority;
+    let pending = false;
+    const restoreZoom = () => {
+        if (originalZoom) body.style.setProperty('zoom', originalZoom, originalPriority);
+        else body.style.removeProperty('zoom');
+    };
+    const fit = () => {
+        pending = false;
+        if (!enabled || !body) return;
+        restoreZoom();
+        const available = Math.min(window.innerWidth, root.clientWidth);
+        if (available <= 0) return;
+        let scale = Number.parseFloat(getComputedStyle(body).zoom) || 1;
+        // Root scrollWidth measures visual overflow outside the zoomed body.
+        // Recheck after scaling because percentage widths and margins can reflow.
+        for (let pass = 0; pass < 4; pass++) {
+            const width = root.scrollWidth;
+            if (width <= available) break;
+            scale *= available / width;
+            body.style.setProperty('zoom', String(scale), 'important');
+        }
+    };
+    const schedule = () => {
+        if (enabled && body && !pending) {
+            pending = true;
+            requestAnimationFrame(fit);
+        }
+    };
+    Object.defineProperty(window, '__hakusMailWidth', {
+        value: (active) => {
+            enabled = active;
+            if (!body) return;
+            if (enabled) fit();
+            else restoreZoom();
+        }
+    });
+    const initialize = () => {
+        root = document.documentElement;
+        body = document.body;
+        if (!body) return;
+        originalZoom = body.style.getPropertyValue('zoom');
+        originalPriority = body.style.getPropertyPriority('zoom');
+        const observer = new ResizeObserver(schedule);
+        observer.observe(root);
+        observer.observe(body);
+        window.addEventListener('resize', schedule);
+        document.addEventListener('load', schedule, true);
+        document.addEventListener('error', schedule, true);
+        schedule();
+    };
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initialize, { once: true });
+    } else initialize();
+})();
+"#;
+
 pub(super) struct Viewer {
     runtime: Arc<Runtime>,
     detail: Option<Arc<MessageView>>,
@@ -17,6 +82,8 @@ pub(super) struct Viewer {
     show_headers: bool,
     remote_images: bool,
     webview: Option<wry::WebView>,
+    fit_width: bool,
+    zoom: f64,
     status: String,
     error: Option<String>,
 }
@@ -30,6 +97,8 @@ impl Viewer {
             show_headers: false,
             remote_images: false,
             webview: None,
+            fit_width: true,
+            zoom: 1.0,
             status: String::new(),
             error: None,
         }
@@ -42,10 +111,18 @@ impl Viewer {
         self.show_headers = false;
         self.remote_images = false;
         self.source_mode = false;
+        self.fit_width = true;
+        self.zoom = 1.0;
         cx.notify();
     }
     fn detach_message(&self, message: Arc<MessageView>, cx: &mut gpui::App) -> anyhow::Result<()> {
         let runtime = self.runtime.clone();
+        let html_mode = self.html_mode;
+        let source_mode = self.source_mode;
+        let show_headers = self.show_headers;
+        let remote_images = self.remote_images;
+        let fit_width = self.fit_width;
+        let zoom = self.zoom;
         let bounds = gpui::Bounds::centered(None, gpui::size(px(860.), px(680.)), cx);
         cx.open_window(
             gpui::WindowOptions {
@@ -54,11 +131,24 @@ impl Viewer {
                 ..Default::default()
             },
             move |window, cx| {
+                window.set_window_title(&format!("{} — Hakus", message.subject));
+                window.activate_window();
                 let reader = cx.new(|cx| {
-                    let mut mailbox = Self::new(runtime, cx);
-                    mailbox.detail = Some(message);
-                    mailbox.html_mode = true;
-                    mailbox
+                    let mut viewer = Self::new(runtime, cx);
+                    viewer.detail = Some(message);
+                    viewer.html_mode = html_mode;
+                    viewer.source_mode = source_mode;
+                    viewer.show_headers = show_headers;
+                    viewer.remote_images = remote_images;
+                    viewer.fit_width = fit_width;
+                    viewer.zoom = zoom;
+                    viewer
+                });
+                let closing_reader = reader.downgrade();
+                window.on_window_should_close(cx, move |_, cx| {
+                    // Detach the native child before GPUI destroys its parent window.
+                    let _ = closing_reader.update(cx, |viewer, _| viewer.webview = None);
+                    true
                 });
                 cx.new(|cx| gpui_component::Root::new(reader, window, cx))
             },
@@ -206,12 +296,31 @@ impl Viewer {
         }
     }
 
+    fn set_zoom(&mut self, zoom: f64, fit_width: bool, cx: &mut Context<Self>) {
+        self.zoom = zoom.clamp(0.25, 3.0);
+        self.fit_width = fit_width;
+        if let Some(view) = &self.webview {
+            let script = if fit_width {
+                "window.__hakusMailWidth(true)"
+            } else {
+                "window.__hakusMailWidth(false)"
+            };
+            if let Err(error) = view
+                .zoom(self.zoom)
+                .and_then(|_| view.evaluate_script(script))
+            {
+                self.error = Some(format!("Message zoom unavailable: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
     fn sync_webview(&mut self, bounds: gpui::Bounds<gpui::Pixels>, window: &mut Window) {
         use wry::{
             dpi::{LogicalPosition, LogicalSize},
             Rect, WebViewBuilder,
         };
-        if self.detail.is_none() {
+        if self.detail.is_none() || bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
             self.hide_webview();
             return;
         }
@@ -235,7 +344,6 @@ impl Viewer {
                 .with_html(html)
                 .with_javascript_disabled()
                 .with_incognito(true)
-                .with_hotkeys_zoom(true)
                 .with_bounds(rect)
                 .with_navigation_handler(|url| {
                     if url == "about:blank" {
@@ -258,14 +366,37 @@ impl Viewer {
                 })
                 .build_as_child(window)
             {
-                Ok(view) => self.webview = Some(view),
+                Ok(view) => {
+                    // Wry queues native evaluation until navigation commits on macOS.
+                    let script = format!(
+                        "{WIDTH_FIT_SCRIPT}\nwindow.__hakusMailWidth({});",
+                        self.fit_width
+                    );
+                    if let Err(error) = view
+                        .zoom(self.zoom)
+                        .and_then(|_| view.evaluate_script(&script))
+                    {
+                        self.error = Some(format!("Message zoom unavailable: {error}"));
+                    }
+                    self.webview = Some(view);
+                }
                 Err(error) => {
                     self.error = Some(format!("HTML view unavailable: {error}"));
                     self.html_mode = false;
                 }
             }
         } else if let Some(view) = &self.webview {
-            if let Err(error) = view.set_bounds(rect).and_then(|_| view.set_visible(true)) {
+            if let Err(error) = view
+                .set_bounds(rect)
+                .and_then(|_| view.set_visible(true))
+                .and_then(|_| {
+                    if self.fit_width {
+                        view.evaluate_script("window.__hakusMailWidth(true)")
+                    } else {
+                        Ok(())
+                    }
+                })
+            {
                 self.error = Some(format!("HTML view unavailable: {error}"));
             }
         }
@@ -300,6 +431,39 @@ impl Render for Viewer {
                     .on_click(
                         cx.listener(|this, _, window, cx| this.set_html_mode(true, window, cx)),
                     ),
+            )
+            .child(
+                Button::new("fit-width")
+                    .label("Fit")
+                    .selected(self.fit_width)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1.0, true, cx))),
+            )
+            .child(
+                Button::new("zoom-out")
+                    .label("−")
+                    .xsmall()
+                    .ghost()
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.set_zoom(this.zoom / 1.25, false, cx)),
+                    ),
+            )
+            .child(
+                Button::new("zoom-reset")
+                    .label(if self.fit_width {
+                        "Actual size".to_owned()
+                    } else {
+                        format!("{:.0}%", self.zoom * 100.0)
+                    })
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.set_zoom(1.0, false, cx))),
+            )
+            .child(
+                Button::new("zoom-in").label("+").xsmall().ghost().on_click(
+                    cx.listener(|this, _, _, cx| this.set_zoom(this.zoom * 1.25, false, cx)),
+                ),
             )
             .child(
                 Button::new("source")
